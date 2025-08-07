@@ -938,7 +938,6 @@ def plot_actual_vs_predicted(test_data, y_test, y_pred, region, product):
 
     return fig
 
-@st.cache_data(ttl=3600)  # Cache for 1 hour to improve performance
 def create_metrics_dashboard(metrics):
     """Create a metrics dashboard with cards."""
     col1, col2, col3, col4, col5 = st.columns(5)
@@ -954,7 +953,6 @@ def create_metrics_dashboard(metrics):
     with col5:
         st.metric("SMAPE", f"{metrics['SMAPE']:.2f}%")
 
-@st.cache_data(ttl=3600)  # Cache for 1 hour to improve performance
 def create_comprehensive_data_overview(df):
     """Create comprehensive data overview with multiple visualizations."""
     
