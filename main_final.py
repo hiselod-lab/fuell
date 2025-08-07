@@ -930,7 +930,7 @@ def plot_actual_vs_predicted(test_data, y_test, y_pred, region, product):
     fig.update_layout(
         title=f"{region} - {product}: Actual vs Predicted Weekly Sales",
         xaxis_title="Date",
-        yaxis_title="Weekly Sales Volume",
+        yaxis_title="Weekly Sales Volume (Litres)",
         height=400,
         template="plotly_white",
         showlegend=True
@@ -963,15 +963,11 @@ def create_comprehensive_data_overview(df):
         "total_records": len(df),
         "unique_regions": df['Region'].nunique(),
         "unique_products": df['Product'].nunique(),
-        "date_range": f"{df['week_start'].min().strftime('%Y-%m-%d') if not isinstance(df['week_start'].min(), str) else df['week_start'].min()} to {df['week_start'].max().strftime('%Y-%m-%d') if not isinstance(df['week_start'].max(), str) else df['week_start'].max()}",
-        "total_sales": f"{df['sales_volume'].sum():,.0f}",
-        "avg_sales": f"{df['sales_volume'].mean():,.0f}",
-        "max_sales": f"{df['sales_volume'].max():,.0f}",
-        "min_sales": f"{df['sales_volume'].min():,.0f}"
+        "date_range": f"{df['week_start'].min().strftime('%Y-%m-%d') if not isinstance(df['week_start'].min(), str) else df['week_start'].min()} to {df['week_start'].max().strftime('%Y-%m-%d') if not isinstance(df['week_start'].max(), str) else df['week_start'].max()}"
     }
-    
+
     # Basic statistics
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4 = st.columns([1, 1, 1, 2])
     with col1:
         st.metric("Total Records", stats["total_records"])
     with col2:
@@ -981,26 +977,12 @@ def create_comprehensive_data_overview(df):
     with col4:
         st.metric("Date Range", stats["date_range"])
     
-    # Sales volume statistics
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Total Sales Volume (Weekly)", stats["total_sales"])
-    with col2:
-        st.metric("Average Weekly Sales Volume", stats["avg_sales"])
-    with col3:
-        st.metric("Max Weekly Sales Volume", stats["max_sales"])
-    with col4:
-        st.metric("Min Weekly Sales Volume", stats["min_sales"])
-    
     # Price statistics by fuel type
     st.markdown("### 💰 Price Statistics by Fuel Type")
     price_stats = df.groupby('Product')['avg_price'].agg(['mean', 'min', 'max', 'std']).round(2)
     price_stats.columns = ['Average Price (PKR)', 'Min Price (PKR)', 'Max Price (PKR)', 'Std Dev (PKR)']
     st.dataframe(prepare_df_for_display(price_stats), use_container_width=True)
-    
-    # Visualizations - One graph per row with better sizing
-    st.markdown("### 📊 Sales Volume Analysis")
-    
+
     # Function to format values with appropriate unit labels
     def format_value_with_unit(value):
         """Format numeric values with unit suffixes, handling array inputs."""
@@ -1017,6 +999,22 @@ def create_comprehensive_data_overview(df):
             return f"{value/1_000:.2f}K"
         else:
             return f"{value:.2f}"
+
+    # Management summary for decision makers
+    st.markdown("### 🏢 Management Summary")
+    region_totals = df.groupby('Region')['sales_volume'].sum()
+    product_totals = df.groupby('Product')['sales_volume'].sum()
+    top_region = region_totals.idxmax()
+    top_region_vol = format_value_with_unit(region_totals.max())
+    top_product = product_totals.idxmax()
+    top_product_vol = format_value_with_unit(product_totals.max())
+    st.markdown(
+        f"- **Top Region by Sales Volume:** {top_region} ({top_region_vol} litres)\n"
+        f"- **Top Product by Sales Volume:** {top_product} ({top_product_vol} litres)"
+    )
+
+    # Visualizations
+    st.markdown("### 📊 Sales Volume Analysis")
     
     # Create region and product charts with caching
     @st.cache_data(ttl=3600)  # Cache for 1 hour
@@ -1036,7 +1034,7 @@ def create_comprehensive_data_overview(df):
             x='Region',
             y='sales_volume',
             title='Total Weekly Sales Volume by Region',
-            labels={'sales_volume': 'Weekly Sales Volume'},
+            labels={'sales_volume': 'Weekly Sales Volume (Litres)'},
             color='sales_volume',
             color_continuous_scale='viridis',
             custom_data='formatted_volume'
@@ -1051,6 +1049,7 @@ def create_comprehensive_data_overview(df):
             font=dict(size=14),
             title_font_size=18,
             xaxis_title_font_size=14,
+            yaxis_title='Weekly Sales Volume (Litres)',
             yaxis_title_font_size=14
         )
         fig_region.update_xaxes(tickangle=45)
@@ -1060,7 +1059,7 @@ def create_comprehensive_data_overview(df):
     def create_product_volume_chart(df):
         # Sales volume by product
         product_volume = df.groupby('Product')['sales_volume'].sum().sort_values(ascending=False)
-        
+
         # Create a DataFrame for px.bar
         product_df = pd.DataFrame({
             'Product': product_volume.index,
@@ -1068,22 +1067,15 @@ def create_comprehensive_data_overview(df):
             'formatted_volume': [format_value_with_unit(val) for val in product_volume.values]
         })
         return product_df
-    
-    # Generate and display the region chart
-    fig_region = create_region_volume_chart(df)
-    st.plotly_chart(fig_region, use_container_width=True)
-    
-    # Generate product data
-    product_df = create_product_volume_chart(df)
-    
-    @st.cache_data(ttl=3600)  # Cache for 1 hour
+
+    @st.cache_data(ttl=3600)
     def create_product_chart(product_df):
         fig_product = px.bar(
             data_frame=product_df,
             x='Product',
             y='sales_volume',
             title='Total Weekly Sales Volume by Product',
-            labels={'sales_volume': 'Weekly Sales Volume'},
+            labels={'sales_volume': 'Weekly Sales Volume (Litres)'},
             color='sales_volume',
             color_continuous_scale='plasma',
             custom_data='formatted_volume'
@@ -1098,42 +1090,76 @@ def create_comprehensive_data_overview(df):
             font=dict(size=14),
             title_font_size=18,
             xaxis_title_font_size=14,
+            yaxis_title='Weekly Sales Volume (Litres)',
             yaxis_title_font_size=14
         )
+        fig_product.update_xaxes(tickangle=45)
         return fig_product
-    
-    # Generate and display the product chart
-    fig_product = create_product_chart(product_df)
-    fig_product.update_xaxes(tickangle=45)
-    st.plotly_chart(fig_product, use_container_width=True)
-    
-    # Time series analysis - Stacked vertically as requested
+
+    @st.cache_data(ttl=3600)
+    def create_heatmap(df):
+        pivot_data = df.groupby(['Region', 'Product'])['sales_volume'].sum().unstack(fill_value=0)
+        formatted_values = []
+        for row in pivot_data.values:
+            formatted_row = [format_value_with_unit(val) for val in row]
+            formatted_values.append(formatted_row)
+        fig_heatmap = px.imshow(
+            pivot_data,
+            title='Weekly Sales Volume Heatmap: Region vs Product',
+            labels=dict(x='Product', y='Region', color='Weekly Sales Volume (Litres)'),
+            aspect='auto',
+        )
+        fig_heatmap.data[0].customdata = formatted_values
+        fig_heatmap.update_traces(
+            hovertemplate='Region: %{y}<br>Product: %{x}<br>Sales Volume: %{z:.2f} (%{customdata})<extra></extra>'
+        )
+        fig_heatmap.update_layout(
+            height=600,
+            width=800,
+            template='plotly_white'
+        )
+        return fig_heatmap
+
+    tab_region, tab_product, tab_heatmap = st.tabs(["By Region", "By Product", "Region vs Product"])
+    with tab_region:
+        fig_region = create_region_volume_chart(df)
+        st.plotly_chart(fig_region, use_container_width=True)
+    with tab_product:
+        product_df = create_product_volume_chart(df)
+        fig_product = create_product_chart(product_df)
+        st.plotly_chart(fig_product, use_container_width=True)
+    with tab_heatmap:
+        fig_heatmap = create_heatmap(df)
+        st.plotly_chart(fig_heatmap, use_container_width=True)
+
+    # Time series analysis
     st.markdown("### 📈 Monthly Sales Volume Trend")
     
-    @st.cache_data(ttl=3600)  # Cache for 1 hour
+    @st.cache_data(ttl=3600)
     def create_monthly_sales_chart(df):
-        # Ensure week_start is datetime type before using .dt accessors
         if not pd.api.types.is_datetime64_any_dtype(df['week_start']):
             df = df.copy()
             df['week_start'] = pd.to_datetime(df['week_start'], errors='coerce')
-        
-        # Monthly sales trend
-        df_monthly = df.groupby(df['week_start'].dt.to_period('M'))['sales_volume'].sum().reset_index()
+
+        df_monthly = (
+            df.groupby([df['week_start'].dt.to_period('M'), 'Product'])['sales_volume']
+            .sum()
+            .reset_index()
+        )
         df_monthly['week_start'] = df_monthly['week_start'].astype(str)
-        
-        # Add formatted volume to the dataframe
         df_monthly['formatted_volume'] = df_monthly['sales_volume'].apply(format_value_with_unit)
-        
+
         fig_monthly = px.line(
             df_monthly,
             x='week_start',
             y='sales_volume',
-            title='Monthly Aggregated Sales Volume Trend',
-            labels={'week_start': 'Month', 'sales_volume': 'Monthly Sales Volume'},
+            color='Product',
+            title='Monthly Sales Volume Trend by Fuel Type',
+            labels={'week_start': 'Month', 'sales_volume': 'Monthly Sales Volume (Litres)', 'Product': 'Fuel Type'},
             custom_data='formatted_volume'
         )
         fig_monthly.update_traces(
-            hovertemplate='Month: %{x}<br>Monthly Sales Volume: %{y:.2f} (%{customdata})<extra></extra>'
+            hovertemplate='Month: %{x}<br>Fuel Type: %{fullData.name}<br>Monthly Sales Volume: %{y:.2f} (%{customdata})<extra></extra>'
         )
         fig_monthly.update_layout(
             height=450,
@@ -1142,11 +1168,10 @@ def create_comprehensive_data_overview(df):
         )
         fig_monthly.update_xaxes(tickangle=45)
         return fig_monthly
-    
-    # Generate and display the monthly sales chart
+
     fig_monthly = create_monthly_sales_chart(df)
     st.plotly_chart(fig_monthly, use_container_width=True)
-    
+
     st.markdown("### 💰 Monthly Average Price Trend by Fuel Type")
     
     @st.cache_data(ttl=3600)  # Cache for 1 hour
@@ -1191,42 +1216,6 @@ def create_comprehensive_data_overview(df):
     fig_price = create_price_trend_chart(df)
     st.plotly_chart(fig_price, use_container_width=True)
     
-    # Region-Product heatmap
-    st.markdown("### 📊 Region-Product Weekly Sales Heatmap")
-    
-    @st.cache_data(ttl=3600)  # Cache for 1 hour
-    def create_heatmap(df):
-        pivot_data = df.groupby(['Region', 'Product'])['sales_volume'].sum().unstack(fill_value=0)
-        
-        # Create a 2D array of formatted values for hover
-        formatted_values = []
-        for row in pivot_data.values:
-            formatted_row = [format_value_with_unit(val) for val in row]
-            formatted_values.append(formatted_row)
-        
-        # Create heatmap with px.imshow (which doesn't support custom_data)
-        fig_heatmap = px.imshow(
-            pivot_data,
-            title='Weekly Sales Volume Heatmap: Region vs Product',
-            labels=dict(x="Product", y="Region", color="Weekly Sales Volume"),
-            aspect="auto"
-        )
-        
-        # Add custom data to the heatmap trace after creation
-        fig_heatmap.data[0].customdata = formatted_values
-        fig_heatmap.update_traces(
-            hovertemplate='Region: %{y}<br>Product: %{x}<br>Sales Volume: %{z:.2f} (%{customdata})<extra></extra>'
-        )
-        fig_heatmap.update_layout(
-            height=600,
-            width=800,
-            template='plotly_white'
-        )
-        return fig_heatmap
-    
-    # Generate and display the heatmap
-    fig_heatmap = create_heatmap(df)
-    st.plotly_chart(fig_heatmap, use_container_width=True)
 
 def main():
     # Initialize session state variables
@@ -2481,7 +2470,7 @@ def main():
                             x='avg_price',
                             y='sales_volume',
                             title=f'Weekly Price vs Volume: {selected_rp[0]} - {selected_rp[1]}',
-                            labels={'avg_price': 'Price (PKR)', 'sales_volume': 'Weekly Sales Volume'},
+                            labels={'avg_price': 'Price (PKR)', 'sales_volume': 'Weekly Sales Volume (Litres)'},
                             custom_data='formatted_volume_scatter'
                         )
                         fig_scatter.update_traces(
