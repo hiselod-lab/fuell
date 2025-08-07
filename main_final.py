@@ -1011,6 +1011,15 @@ def create_comprehensive_data_overview(df):
         else:
             return str(int(value))
 
+    def get_milestone_ticks(max_val: float) -> list[float]:
+        """Return milestone tick positions up to max_val."""
+        ticks = [v for v in [9e7, 1e8, 2e8, 3e8, 4e8] if v <= max_val]
+        current = 1e9
+        while current <= max_val:
+            ticks.append(current)
+            current += 1e9
+        return ticks
+
     # Visualizations
     st.markdown("### 📊 Sales Volume Analysis")
     
@@ -1019,38 +1028,38 @@ def create_comprehensive_data_overview(df):
     def create_region_volume_chart(df):
         # Sales volume by region
         region_volume = df.groupby('Region')['sales_volume'].sum().sort_values(ascending=False)
-        
-        # Create a DataFrame for px.bar
+
         region_df = pd.DataFrame({
             'Region': region_volume.index,
             'sales_volume': region_volume.values,
             'formatted_volume': [format_value_with_unit(val) for val in region_volume.values]
         })
-        
+
         fig_region = px.bar(
             data_frame=region_df,
-            x='Region',
-            y='sales_volume',
+            x='sales_volume',
+            y='Region',
+            orientation='h',
             title='Total Weekly Sales Volume by Region',
             labels={'sales_volume': 'Weekly Sales Volume (Litres)'},
             color='sales_volume',
-            color_continuous_scale='viridis',
+            color_continuous_scale='Blues',
             custom_data='formatted_volume'
         )
         fig_region.update_traces(
-            hovertemplate='Region: %{x}<br>Sales Volume: %{y:.2f} (%{customdata})<extra></extra>'
+            hovertemplate='Region: %{y}<br>Sales Volume: %{x:.2f} (%{customdata})<extra></extra>'
         )
         fig_region.update_layout(
-            height=500,
+            height=450,
             width=800,
             template='plotly_white',
             font=dict(size=14),
             title_font_size=18,
+            xaxis_title='Weekly Sales Volume (Litres)',
             xaxis_title_font_size=14,
-            yaxis_title='Weekly Sales Volume (Litres)',
-            yaxis_title_font_size=14
+            showlegend=False,
+            coloraxis_showscale=False
         )
-        fig_region.update_xaxes(tickangle=45)
         return fig_region
     
     @st.cache_data(ttl=3600)  # Cache for 1 hour
@@ -1095,7 +1104,7 @@ def create_comprehensive_data_overview(df):
         )
         if log_y:
             max_val = product_df['sales_volume'].max()
-            tick_vals = [9e7] + [1e8 * i for i in range(1, int(max_val / 1e8) + 2)]
+            tick_vals = get_milestone_ticks(max_val)
             tick_text = [format_tick(v) for v in tick_vals]
             fig_product.update_yaxes(tickvals=tick_vals, ticktext=tick_text)
         fig_product.update_xaxes(tickangle=45)
@@ -1127,33 +1136,24 @@ def create_comprehensive_data_overview(df):
         )
         if log_y:
             max_val = rp_data['sales_volume'].max()
-            tick_vals = [9e7] + [1e8 * i for i in range(1, int(max_val / 1e8) + 2)]
+            tick_vals = get_milestone_ticks(max_val)
             tick_text = [format_tick(v) for v in tick_vals]
             fig_rp.update_yaxes(tickvals=tick_vals, ticktext=tick_text)
         fig_rp.update_xaxes(tickangle=45)
         return fig_rp
-
     tab_region, tab_product, tab_region_product = st.tabs(["By Region", "By Product", "Region vs Product"])
     with tab_region:
         fig_region = create_region_volume_chart(df)
         st.plotly_chart(fig_region, use_container_width=True)
     with tab_product:
         product_df = create_product_volume_chart(df)
-        sub_normal, sub_lagged = st.tabs(["Normal", "Lagged"])
-        with sub_normal:
-            fig_product = create_product_chart(product_df)
-            st.plotly_chart(fig_product, use_container_width=True)
-        with sub_lagged:
-            fig_product_lag = create_product_chart(product_df, log_y=True)
-            st.plotly_chart(fig_product_lag, use_container_width=True)
+        show_lagged_product = st.toggle("Show Lagged Values", key="product_toggle")
+        fig_product = create_product_chart(product_df, log_y=show_lagged_product)
+        st.plotly_chart(fig_product, use_container_width=True)
     with tab_region_product:
-        rp_normal, rp_lagged = st.tabs(["Normal", "Lagged"])
-        with rp_normal:
-            fig_rp = create_region_product_chart(df)
-            st.plotly_chart(fig_rp, use_container_width=True)
-        with rp_lagged:
-            fig_rp_log = create_region_product_chart(df, log_y=True)
-            st.plotly_chart(fig_rp_log, use_container_width=True)
+        show_lagged_rp = st.toggle("Show Lagged Values", key="rp_toggle")
+        fig_rp = create_region_product_chart(df, log_y=show_lagged_rp)
+        st.plotly_chart(fig_rp, use_container_width=True)
 
     # Time series analysis
     st.markdown("### 📈 Monthly Sales Volume Trend")
@@ -1192,19 +1192,15 @@ def create_comprehensive_data_overview(df):
         )
         if log_y:
             max_val = df_monthly['sales_volume'].max()
-            tick_vals = [9e7] + [1e8 * i for i in range(1, int(max_val / 1e8) + 2)]
+            tick_vals = get_milestone_ticks(max_val)
             tick_text = [format_tick(v) for v in tick_vals]
             fig_monthly.update_yaxes(tickvals=tick_vals, ticktext=tick_text)
         fig_monthly.update_xaxes(tickangle=45)
         return fig_monthly
 
-    month_normal, month_lagged = st.tabs(["Normal", "Lagged"])
-    with month_normal:
-        fig_monthly = create_monthly_sales_chart(df)
-        st.plotly_chart(fig_monthly, use_container_width=True)
-    with month_lagged:
-        fig_monthly_log = create_monthly_sales_chart(df, log_y=True)
-        st.plotly_chart(fig_monthly_log, use_container_width=True)
+    show_lagged_month = st.toggle("Show Lagged Values", key="monthly_toggle")
+    fig_monthly = create_monthly_sales_chart(df, log_y=show_lagged_month)
+    st.plotly_chart(fig_monthly, use_container_width=True)
 
     st.markdown("### 💰 Monthly Average Price Trend by Fuel Type")
     
