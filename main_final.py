@@ -1000,6 +1000,15 @@ def create_comprehensive_data_overview(df):
         else:
             return f"{value:.2f}"
 
+    def generate_log_ticks(min_val, max_val):
+        step = 10 ** (np.floor(np.log10(max_val)) - 1)
+        ticks = []
+        if min_val < step:
+            ticks.append(0.9 * step)
+        ticks.extend(np.arange(step, max_val + step, step))
+        tick_text = [format_value_with_unit(val) for val in ticks]
+        return ticks, tick_text
+
     # Visualizations
     st.markdown("### 📊 Sales Volume Analysis")
     
@@ -1061,10 +1070,10 @@ def create_comprehensive_data_overview(df):
             data_frame=product_df,
             x='Product',
             y='sales_volume',
-            title='Total Weekly Sales Volume by Product',
-            labels={'sales_volume': 'Weekly Sales Volume (Litres)'},
-            color='sales_volume',
-            color_continuous_scale='plasma',
+            title='Total Sales Volume by Product',
+            labels={'sales_volume': 'Sales Volume (Litres)'},
+            color='Product',
+            color_discrete_sequence=px.colors.qualitative.Plotly,
             custom_data='formatted_volume'
         )
         fig_product.update_traces(
@@ -1077,14 +1086,15 @@ def create_comprehensive_data_overview(df):
             font=dict(size=14),
             title_font_size=18,
             xaxis_title_font_size=14,
-            yaxis_title='Weekly Sales Volume (Litres)',
-            yaxis_title_font_size=14
+            yaxis_title='Sales Volume (Litres)',
+            yaxis_title_font_size=14,
+            showlegend=False
         )
         fig_product.update_xaxes(tickangle=45)
         return fig_product
 
     @st.cache_data(ttl=3600)
-    def create_region_product_chart(df):
+    def create_region_product_chart(df, log_scale=False):
         rp_data = df.groupby(['Region', 'Product'])['sales_volume'].sum().reset_index()
         rp_data['formatted_volume'] = rp_data['sales_volume'].apply(format_value_with_unit)
         fig_rp = px.bar(
@@ -1093,11 +1103,14 @@ def create_comprehensive_data_overview(df):
             y='sales_volume',
             color='Product',
             barmode='group',
-            title='Weekly Sales Volume by Region and Product',
-            labels={'sales_volume': 'Weekly Sales Volume (Litres)'},
+            title='Sales Volume by Region and Product',
+            labels={'sales_volume': 'Sales Volume (Litres)'},
             custom_data='formatted_volume',
-            log_y=True
+            log_y=log_scale
         )
+        if log_scale:
+            ticks, tick_text = generate_log_ticks(rp_data['sales_volume'].min(), rp_data['sales_volume'].max())
+            fig_rp.update_yaxes(tickvals=ticks, ticktext=tick_text, type='log')
         fig_rp.update_traces(
             hovertemplate='Region: %{x}<br>Product: %{fullData.name}<br>Sales Volume: %{y:.2f} (%{customdata})<extra></extra>'
         )
@@ -1105,7 +1118,7 @@ def create_comprehensive_data_overview(df):
             height=600,
             width=800,
             template='plotly_white',
-            yaxis_title='Weekly Sales Volume (Litres)'
+            yaxis_title='Sales Volume (Litres)'
         )
         fig_rp.update_xaxes(tickangle=45)
         return fig_rp
@@ -1119,14 +1132,19 @@ def create_comprehensive_data_overview(df):
         fig_product = create_product_chart(product_df)
         st.plotly_chart(fig_product, use_container_width=True)
     with tab_region_product:
-        fig_rp = create_region_product_chart(df)
-        st.plotly_chart(fig_rp, use_container_width=True)
+        rp_linear, rp_log = st.tabs(["Normal Values", "Lagged Values"])
+        with rp_linear:
+            fig_rp = create_region_product_chart(df)
+            st.plotly_chart(fig_rp, use_container_width=True)
+        with rp_log:
+            fig_rp_log = create_region_product_chart(df, log_scale=True)
+            st.plotly_chart(fig_rp_log, use_container_width=True)
 
     # Time series analysis
     st.markdown("### 📈 Monthly Sales Volume Trend")
     
     @st.cache_data(ttl=3600)
-    def create_monthly_sales_chart(df):
+    def create_monthly_sales_chart(df, log_scale=False):
         if not pd.api.types.is_datetime64_any_dtype(df['week_start']):
             df = df.copy()
             df['week_start'] = pd.to_datetime(df['week_start'], errors='coerce')
@@ -1147,8 +1165,11 @@ def create_comprehensive_data_overview(df):
             title='Monthly Sales Volume Trend by Fuel Type',
             labels={'week_start': 'Month', 'sales_volume': 'Monthly Sales Volume (Litres)', 'Product': 'Fuel Type'},
             custom_data='formatted_volume',
-            log_y=True
+            log_y=log_scale
         )
+        if log_scale:
+            ticks, tick_text = generate_log_ticks(df_monthly['sales_volume'].min(), df_monthly['sales_volume'].max())
+            fig_monthly.update_yaxes(tickvals=ticks, ticktext=tick_text, type='log')
         fig_monthly.update_traces(
             hovertemplate='Month: %{x}<br>Fuel Type: %{fullData.name}<br>Monthly Sales Volume: %{y:.2f} (%{customdata})<extra></extra>'
         )
@@ -1160,8 +1181,13 @@ def create_comprehensive_data_overview(df):
         fig_monthly.update_xaxes(tickangle=45)
         return fig_monthly
 
-    fig_monthly = create_monthly_sales_chart(df)
-    st.plotly_chart(fig_monthly, use_container_width=True)
+    ms_linear, ms_log = st.tabs(["Normal Values", "Lagged Values"])
+    with ms_linear:
+        fig_monthly = create_monthly_sales_chart(df)
+        st.plotly_chart(fig_monthly, use_container_width=True)
+    with ms_log:
+        fig_monthly_log = create_monthly_sales_chart(df, log_scale=True)
+        st.plotly_chart(fig_monthly_log, use_container_width=True)
 
     st.markdown("### 💰 Monthly Average Price Trend by Fuel Type")
     
