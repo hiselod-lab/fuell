@@ -1029,16 +1029,17 @@ def create_comprehensive_data_overview(df):
         
         fig_region = px.bar(
             data_frame=region_df,
-            x='Region',
-            y='sales_volume',
+            x='sales_volume',
+            y='Region',
+            orientation='h',
             title='Total Weekly Sales Volume by Region',
-            labels={'sales_volume': 'Weekly Sales Volume (Litres)'},
+            labels={'sales_volume': 'Weekly Sales Volume (Litres)', 'Region': 'Region'},
             color='sales_volume',
-            color_continuous_scale='viridis',
+            color_continuous_scale='Blues',
             custom_data='formatted_volume'
         )
         fig_region.update_traces(
-            hovertemplate='Region: %{x}<br>Sales Volume: %{y:.2f} (%{customdata})<extra></extra>'
+            hovertemplate='Region: %{y}<br>Sales Volume: %{x:.2f} (%{customdata})<extra></extra>'
         )
         fig_region.update_layout(
             height=500,
@@ -1046,11 +1047,12 @@ def create_comprehensive_data_overview(df):
             template='plotly_white',
             font=dict(size=14),
             title_font_size=18,
-            xaxis_title_font_size=14,
-            yaxis_title='Weekly Sales Volume (Litres)',
-            yaxis_title_font_size=14
+            xaxis_title='Weekly Sales Volume (Litres)',
+            yaxis_title_font_size=14,
+            coloraxis_showscale=False,
+            showlegend=False
         )
-        fig_region.update_xaxes(tickangle=45)
+        fig_region.update_yaxes(categoryorder='array', categoryarray=list(region_df['Region']))
         return fig_region
     
     @st.cache_data(ttl=3600)  # Cache for 1 hour
@@ -1133,27 +1135,33 @@ def create_comprehensive_data_overview(df):
         fig_rp.update_xaxes(tickangle=45)
         return fig_rp
 
-    tab_region, tab_product, tab_region_product = st.tabs(["By Region", "By Product", "Region vs Product"])
-    with tab_region:
+    col_region, col_product, col_rp = st.columns(3)
+    if 'view_selection' not in st.session_state:
+        st.session_state.view_selection = 'Region'
+    with col_region:
+        if st.button("🌍", help="Sales Volume by Region"):
+            st.session_state.view_selection = 'Region'
+    with col_product:
+        if st.button("🛢️", help="Sales Volume by Product"):
+            st.session_state.view_selection = 'Product'
+    with col_rp:
+        if st.button("🌍🛢️", help="Region vs Product"):
+            st.session_state.view_selection = 'Region vs Product'
+    view_selection = st.session_state.view_selection
+
+    view_mode = st.radio("View Mode", ["Normal", "Lagged"], horizontal=True)
+    log_y = view_mode == "Lagged"
+
+    if view_selection == 'Region':
         fig_region = create_region_volume_chart(df)
         st.plotly_chart(fig_region, use_container_width=True)
-    with tab_product:
+    elif view_selection == 'Product':
         product_df = create_product_volume_chart(df)
-        sub_normal, sub_lagged = st.tabs(["Normal", "Lagged"])
-        with sub_normal:
-            fig_product = create_product_chart(product_df)
-            st.plotly_chart(fig_product, use_container_width=True)
-        with sub_lagged:
-            fig_product_lag = create_product_chart(product_df, log_y=True)
-            st.plotly_chart(fig_product_lag, use_container_width=True)
-    with tab_region_product:
-        rp_normal, rp_lagged = st.tabs(["Normal", "Lagged"])
-        with rp_normal:
-            fig_rp = create_region_product_chart(df)
-            st.plotly_chart(fig_rp, use_container_width=True)
-        with rp_lagged:
-            fig_rp_log = create_region_product_chart(df, log_y=True)
-            st.plotly_chart(fig_rp_log, use_container_width=True)
+        fig_product = create_product_chart(product_df, log_y=log_y)
+        st.plotly_chart(fig_product, use_container_width=True)
+    else:
+        fig_rp = create_region_product_chart(df, log_y=log_y)
+        st.plotly_chart(fig_rp, use_container_width=True)
 
     # Time series analysis
     st.markdown("### 📈 Monthly Sales Volume Trend")
@@ -1190,21 +1198,21 @@ def create_comprehensive_data_overview(df):
             width=800,
             template='plotly_white'
         )
+        max_val = df_monthly['sales_volume'].max()
         if log_y:
-            max_val = df_monthly['sales_volume'].max()
-            tick_vals = [9e7] + [1e8 * i for i in range(1, int(max_val / 1e8) + 2)]
+            tick_vals = [90e6, 100e6, 200e6, 300e6, 400e6, 1e9, 2e9, 3e9]
             tick_text = [format_tick(v) for v in tick_vals]
             fig_monthly.update_yaxes(tickvals=tick_vals, ticktext=tick_text)
+        else:
+            tick_vals = [i * 1e8 for i in range(0, int(max_val / 1e8) + 1)]
+            tick_text = [format_tick(v) for v in tick_vals]
+            fig_monthly.update_yaxes(range=[0, max_val * 1.05], tickvals=tick_vals, ticktext=tick_text)
         fig_monthly.update_xaxes(tickangle=45)
         return fig_monthly
 
-    month_normal, month_lagged = st.tabs(["Normal", "Lagged"])
-    with month_normal:
-        fig_monthly = create_monthly_sales_chart(df)
-        st.plotly_chart(fig_monthly, use_container_width=True)
-    with month_lagged:
-        fig_monthly_log = create_monthly_sales_chart(df, log_y=True)
-        st.plotly_chart(fig_monthly_log, use_container_width=True)
+    monthly_mode = st.radio("View Mode", ["Normal", "Lagged"], key="monthly_view_mode", horizontal=True)
+    fig_monthly = create_monthly_sales_chart(df, log_y=(monthly_mode == "Lagged"))
+    st.plotly_chart(fig_monthly, use_container_width=True)
 
     st.markdown("### 💰 Monthly Average Price Trend by Fuel Type")
     
