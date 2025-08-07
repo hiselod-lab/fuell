@@ -1000,19 +1000,6 @@ def create_comprehensive_data_overview(df):
         else:
             return f"{value:.2f}"
 
-    # Management summary for decision makers
-    st.markdown("### 🏢 Management Summary")
-    region_totals = df.groupby('Region')['sales_volume'].sum()
-    product_totals = df.groupby('Product')['sales_volume'].sum()
-    top_region = region_totals.idxmax()
-    top_region_vol = format_value_with_unit(region_totals.max())
-    top_product = product_totals.idxmax()
-    top_product_vol = format_value_with_unit(product_totals.max())
-    st.markdown(
-        f"- **Top Region by Sales Volume:** {top_region} ({top_region_vol} litres)\n"
-        f"- **Top Product by Sales Volume:** {top_product} ({top_product_vol} litres)"
-    )
-
     # Visualizations
     st.markdown("### 📊 Sales Volume Analysis")
     
@@ -1097,30 +1084,33 @@ def create_comprehensive_data_overview(df):
         return fig_product
 
     @st.cache_data(ttl=3600)
-    def create_heatmap(df):
-        pivot_data = df.groupby(['Region', 'Product'])['sales_volume'].sum().unstack(fill_value=0)
-        formatted_values = []
-        for row in pivot_data.values:
-            formatted_row = [format_value_with_unit(val) for val in row]
-            formatted_values.append(formatted_row)
-        fig_heatmap = px.imshow(
-            pivot_data,
-            title='Weekly Sales Volume Heatmap: Region vs Product',
-            labels=dict(x='Product', y='Region', color='Weekly Sales Volume (Litres)'),
-            aspect='auto',
+    def create_region_product_chart(df, log_scale=False):
+        rp_data = df.groupby(['Region', 'Product'])['sales_volume'].sum().reset_index()
+        rp_data['formatted_volume'] = rp_data['sales_volume'].apply(format_value_with_unit)
+        fig_rp = px.bar(
+            rp_data,
+            x='Region',
+            y='sales_volume',
+            color='Product',
+            barmode='group',
+            title='Weekly Sales Volume: Region vs Product',
+            labels={'sales_volume': 'Weekly Sales Volume (Litres)'},
+            custom_data='formatted_volume'
         )
-        fig_heatmap.data[0].customdata = formatted_values
-        fig_heatmap.update_traces(
-            hovertemplate='Region: %{y}<br>Product: %{x}<br>Sales Volume: %{z:.2f} (%{customdata})<extra></extra>'
+        fig_rp.update_traces(
+            hovertemplate='Region: %{x}<br>Product: %{fullData.name}<br>Sales Volume: %{y:.2f} (%{customdata})<extra></extra>'
         )
-        fig_heatmap.update_layout(
+        fig_rp.update_layout(
             height=600,
             width=800,
             template='plotly_white'
         )
-        return fig_heatmap
+        fig_rp.update_xaxes(tickangle=45)
+        if log_scale:
+            fig_rp.update_yaxes(type='log')
+        return fig_rp
 
-    tab_region, tab_product, tab_heatmap = st.tabs(["By Region", "By Product", "Region vs Product"])
+    tab_region, tab_product, tab_rp = st.tabs(["By Region", "By Product", "Region vs Product"])
     with tab_region:
         fig_region = create_region_volume_chart(df)
         st.plotly_chart(fig_region, use_container_width=True)
@@ -1128,15 +1118,16 @@ def create_comprehensive_data_overview(df):
         product_df = create_product_volume_chart(df)
         fig_product = create_product_chart(product_df)
         st.plotly_chart(fig_product, use_container_width=True)
-    with tab_heatmap:
-        fig_heatmap = create_heatmap(df)
-        st.plotly_chart(fig_heatmap, use_container_width=True)
+    with tab_rp:
+        log_scale_rp = st.checkbox("Use logarithmic scale", value=False, key="log_rp")
+        fig_rp = create_region_product_chart(df, log_scale_rp)
+        st.plotly_chart(fig_rp, use_container_width=True)
 
     # Time series analysis
     st.markdown("### 📈 Monthly Sales Volume Trend")
     
     @st.cache_data(ttl=3600)
-    def create_monthly_sales_chart(df):
+    def create_monthly_sales_chart(df, log_scale=False):
         if not pd.api.types.is_datetime64_any_dtype(df['week_start']):
             df = df.copy()
             df['week_start'] = pd.to_datetime(df['week_start'], errors='coerce')
@@ -1167,9 +1158,12 @@ def create_comprehensive_data_overview(df):
             template='plotly_white'
         )
         fig_monthly.update_xaxes(tickangle=45)
+        if log_scale:
+            fig_monthly.update_yaxes(type='log')
         return fig_monthly
 
-    fig_monthly = create_monthly_sales_chart(df)
+    log_scale_monthly = st.checkbox("Use logarithmic scale", value=False, key="log_monthly")
+    fig_monthly = create_monthly_sales_chart(df, log_scale_monthly)
     st.plotly_chart(fig_monthly, use_container_width=True)
 
     st.markdown("### 💰 Monthly Average Price Trend by Fuel Type")
