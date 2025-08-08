@@ -525,9 +525,9 @@ def enhanced_feature_engineering(df, forecasting_mode=False, random_state=42):
                                        np.nan)
 
     if forecasting_mode:
-        df['weather_factor'] = 1.0
-        df['economic_factor'] = 1.0
-        df['event_factor'] = 1.0
+        df['weather_factor'] = np.random.normal(1, 0.1, len(df))
+        df['economic_factor'] = np.random.normal(1, 0.05, len(df))
+        df['event_factor'] = np.random.normal(1, 0.15, len(df))
     else:
         np.random.seed(random_state)
         df['weather_factor'] = np.random.normal(1, 0.1, len(df))
@@ -559,8 +559,13 @@ def train_models(df, feature_cols, params, train_ratio=0.8, split_method='time')
         split_point = int(len(df) * train_ratio)
         train = df.iloc[:split_point]
         test = df.iloc[split_point:]
+        train_start_date = train['week_start'].min() if 'week_start' in train else None
+        train_end_date = train['week_start'].max() if 'week_start' in train else None
+        test_start_date = test['week_start'].min() if 'week_start' in test else None
+        test_end_date = test['week_start'].max() if 'week_start' in test else None
     else:
         train, test = train_test_split(df, train_size=train_ratio, random_state=42, shuffle=True)
+        train_start_date = train_end_date = test_start_date = test_end_date = None
 
     X_train, y_train = train[feature_cols], train['sales_volume']
     X_test, y_test = test[feature_cols], test['sales_volume']
@@ -644,7 +649,18 @@ def train_models(df, feature_cols, params, train_ratio=0.8, split_method='time')
         'ensemble_method': params.get('ensemble_method', 'Average'),
         'lgbm_weight': params.get('lgbm_weight', 0.5),
         'residual_std': residual_std,
-        'metrics': metrics
+        'metrics': metrics,
+        'y_test': y_test,
+        'y_pred': ensemble_pred,
+        'test_data': test,
+        'feature_selection_enabled': params.get('feature_selection', True),
+        'train_test_dates': {
+            'train_start_date': train_start_date,
+            'train_end_date': train_end_date,
+            'test_start_date': test_start_date,
+            'test_end_date': test_end_date,
+            'split_method': 'Time-based' if split_method == 'time' else 'Random'
+        }
     }
     return model_bundle
 
@@ -707,26 +723,17 @@ def generate_forecast(model_bundle, history, steps, include_confidence=True, con
 
 def generate_detailed_forecast(res, group_eng, product, forecast_weeks, forecast_method,
                                include_confidence, confidence_level):
-    """Replicate the original detailed forecasting logic.
-
-    This function mirrors the extensive forecasting routine previously embedded
-    in the training loop. It regenerates time and seasonal features, applies
-    product-specific randomisation and handles both direct and recursive
-    strategies while optionally producing confidence intervals.
-    """
+    """Generate forecasts while recalculating features at each step."""
 
     models = res.get('models', {})
     lgbm = models.get('lgbm')
     rf = models.get('rf')
-    metrics = res.get('metrics', {})
-    y_test = res.get('y_test', pd.Series(dtype=float))
     imputer = res.get('imputer')
     selector = res.get('selector')
     feature_cols = res.get('feature_cols', [])
-    selected_features = res.get('selected_features', [])
-    feature_selection_enabled = res.get('feature_selection_enabled', False)
     ensemble_method = res.get('ensemble_method', 'Average')
     lgbm_weight = res.get('lgbm_weight', 0.5)
+    residual_std = res.get('residual_std', 0.0)
 
     if not feature_cols or lgbm is None or rf is None or imputer is None:
         return {
@@ -740,214 +747,62 @@ def generate_detailed_forecast(res, group_eng, product, forecast_weeks, forecast
             'confidence_level': confidence_level if include_confidence else None,
         }
 
-    group_eng = group_eng.copy()
-    if not pd.api.types.is_datetime64_any_dtype(group_eng['week_start']):
-        group_eng['week_start'] = pd.to_datetime(group_eng['week_start'])
+    history = group_eng.copy().sort_values('week_start')
+    if not pd.api.types.is_datetime64_any_dtype(history['week_start']):
+        history['week_start'] = pd.to_datetime(history['week_start'])
 
-    last_data = group_eng.iloc[-1:].copy()
-    last_date = pd.to_datetime(last_data['week_start'].iloc[0])
+    forecasts, lower_bounds, upper_bounds, dates = [], [], [], []
+    z_lookup = {0.99: 2.58, 0.95: 1.96, 0.9: 1.645, 0.85: 1.44, 0.8: 1.28}
+    z = z_lookup.get(confidence_level, 1.96)
 
-    forecast_dates = [last_date + timedelta(days=7 * i) for i in range(1, forecast_weeks + 1)]
-    forecast_values = []
-    lower_bounds = []
-    upper_bounds = []
+    base_history = history.copy()
 
-    if forecast_method == 'Direct':
-        for i in range(forecast_weeks):
-            future_data = last_data.copy()
-            future_data['week_start'] = forecast_dates[i]
-            future_data['week_start'] = pd.to_datetime(future_data['week_start'])
-            future_data['month'] = future_data['week_start'].dt.month
-            future_data['year'] = future_data['week_start'].dt.year
-            future_data['week_of_year'] = future_data['week_start'].dt.isocalendar().week
-            future_data['seasonal_sin'] = np.sin(2 * np.pi * future_data['week_of_year'] / 52)
-            future_data['seasonal_cos'] = np.cos(2 * np.pi * future_data['week_of_year'] / 52)
-            future_data['quarterly_sin'] = np.sin(2 * np.pi * future_data['week_of_year'] / 13)
-            future_data['quarterly_cos'] = np.cos(2 * np.pi * future_data['week_of_year'] / 13)
-            future_data['monthly_sin'] = np.sin(2 * np.pi * future_data['month'] / 12)
-            future_data['monthly_cos'] = np.cos(2 * np.pi * future_data['month'] / 12)
-            future_data['trend_factor'] = future_data['week_of_year'] / 52
-            future_data['trend_squared'] = (future_data['week_of_year'] / 52) ** 2
-            future_data['price_change'] = 0
+    for step in range(1, forecast_weeks + 1):
+        if forecast_method == 'Direct':
+            next_date = base_history['week_start'].iloc[-1] + timedelta(days=7 * step)
+            new_row = base_history.iloc[-1:].copy()
+            new_row['week_start'] = next_date
+            temp_history = pd.concat([base_history, new_row], ignore_index=True)
+        else:  # Recursive
+            next_date = history['week_start'].iloc[-1] + timedelta(days=7)
+            new_row = history.iloc[-1:].copy()
+            new_row['week_start'] = next_date
+            history = pd.concat([history, new_row], ignore_index=True)
+            temp_history = history
 
-            is_hobc = product == 'HOBC'
-            historical_volatility = metrics.get('RMSE', 0) / y_test.mean() if len(y_test) > 0 and y_test.mean() > 0 else 0.05
-            base_variation_factor = max(0.02, historical_volatility * 0.3) * (1 + i * 0.15)
-            if is_hobc:
-                variation_factor = base_variation_factor * 3.0
-                min_absolute_variation = 1000
-            else:
-                variation_factor = base_variation_factor * 1.5
-                min_absolute_variation = 250
+        eng = enhanced_feature_engineering(temp_history, forecasting_mode=True)
+        features = eng[feature_cols].iloc[-1:]
+        features_clean = pd.DataFrame(imputer.transform(features), columns=feature_cols, index=features.index)
+        if selector is not None:
+            features_sel = selector.transform(features_clean)
+        else:
+            features_sel = features_clean.values
 
-            relative_change = np.random.normal(0, variation_factor)
-            future_data['volume_change'] = relative_change
+        pred_lgbm = lgbm.predict(features_sel)
+        pred_rf = rf.predict(features_sel)
+        if ensemble_method == 'Weighted Average':
+            forecast_val = (lgbm_weight * pred_lgbm + (1 - lgbm_weight) * pred_rf)[0]
+        else:
+            forecast_val = ((pred_lgbm + pred_rf) / 2)[0]
 
-            if len(y_test) > 1:
-                historical_trend = 1 if y_test.iloc[-1] > y_test.iloc[0] else -1
-                trend_strength = min(1.0, abs(y_test.iloc[-1] - y_test.iloc[0]) / (y_test.mean() + 1e-10))
-            else:
-                historical_trend = 1
-                trend_strength = 0.5
+        forecasts.append(forecast_val)
+        dates.append(temp_history['week_start'].iloc[-1])
 
-            volatility_factor = 0.02 * (i + 1) * (3.0 if is_hobc else 1.0)
-            trend_factor = 0.03 * (i + 1) * (3.0 if is_hobc else 1.0)
-            regional_product_factor = 0.01 * (i + 1) * (3.0 if is_hobc else 1.0)
-            trend_bias = historical_trend * trend_strength * 0.01 * (i + 1)
+        if include_confidence:
+            margin = z * residual_std
+            lower_bounds.append(max(0, forecast_val - margin))
+            upper_bounds.append(forecast_val + margin)
+        else:
+            lower_bounds.append(None)
+            upper_bounds.append(None)
 
-            future_data['price_volatility'] *= (1 + np.random.normal(trend_bias, volatility_factor))
-            future_data['volume_trend'] *= (1 + np.random.normal(trend_bias * 1.5, trend_factor))
-            future_data['volume_volatility'] *= (1 + np.random.normal(trend_bias, volatility_factor))
-            future_data['regional_trend'] *= (1 + np.random.normal(trend_bias, regional_product_factor))
-            future_data['product_trend'] *= (1 + np.random.normal(trend_bias, regional_product_factor))
-
-            rolling_factor = 0.02 * (i + 1) * (3.0 if is_hobc else 1.0)
-            for window in [4, 8, 12]:
-                if f'roll{window}_mean' in future_data.columns:
-                    window_adjusted_factor = rolling_factor * (1.0 + (1.0 / window))
-                    window_trend_bias = trend_bias * (1.0 + (1.0 / window))
-                    mean_change = np.random.normal(window_trend_bias, window_adjusted_factor)
-                    future_data[f'roll{window}_mean'] *= (1 + mean_change)
-                    if is_hobc:
-                        abs_variation = min_absolute_variation * (1.0 + (0.5 / window))
-                        direction_prob = 0.5 + (0.3 * historical_trend)
-                        direction = np.random.choice([-1, 1], p=[1-direction_prob, direction_prob]) if historical_trend > 0 else np.random.choice([-1, 1], p=[direction_prob, 1-direction_prob])
-                        future_data[f'roll{window}_mean'] += direction * abs_variation
-                    elif min_absolute_variation > 0:
-                        direction_prob = 0.5 + (0.2 * historical_trend)
-                        direction = np.random.choice([-1, 1], p=[1-direction_prob, direction_prob]) if historical_trend > 0 else np.random.choice([-1, 1], p=[direction_prob, 1-direction_prob])
-                        future_data[f'roll{window}_mean'] += direction * min_absolute_variation * (0.5 + (0.2 / window))
-
-                if f'roll{window}_std' in future_data.columns:
-                    std_factor = rolling_factor * (1.0 + historical_volatility)
-                    future_data[f'roll{window}_std'] *= (1 + np.random.normal(0, std_factor))
-                    min_std = min_absolute_variation * 0.2 * historical_volatility if is_hobc else min_absolute_variation * 0.1 * historical_volatility
-                    if min_std > 0:
-                        future_data[f'roll{window}_std'] = future_data[f'roll{window}_std'].clip(lower=min_std)
-
-            X_future = future_data[feature_cols]
-            X_future_clean = pd.DataFrame(imputer.transform(X_future), columns=feature_cols, index=X_future.index)
-            if feature_selection_enabled and selector is not None:
-                X_future_sel = selector.transform(X_future_clean)
-            else:
-                X_future_sel = X_future_clean.values
-            X_future_sel = np.nan_to_num(X_future_sel, nan=0.0, posinf=0.0, neginf=0.0)
-
-            pred_lgbm_future = lgbm.predict(X_future_sel)
-            pred_rf_future = rf.predict(X_future_sel)
-            if ensemble_method == "Weighted Average":
-                ensemble_pred_future = (lgbm_weight * pred_lgbm_future) + ((1 - lgbm_weight) * pred_rf_future)
-            else:
-                ensemble_pred_future = (pred_lgbm_future + pred_rf_future) / 2
-
-            forecast_values.append(ensemble_pred_future[0])
-
-            if include_confidence:
-                mae = metrics.get('MAE', 0)
-                rmse = metrics.get('RMSE', 0)
-                error_estimate = (0.7 * mae) + (0.3 * rmse)
-                z_score = 1.96
-                if confidence_level == 0.99:
-                    z_score = 2.58
-                elif confidence_level == 0.9:
-                    z_score = 1.645
-                elif confidence_level == 0.85:
-                    z_score = 1.44
-                elif confidence_level == 0.8:
-                    z_score = 1.28
-                if is_hobc:
-                    step_factor = 1 + (i * 0.2)
-                    min_margin = 2000 * (i + 1)
-                else:
-                    step_factor = 1 + (i * 0.1)
-                    min_margin = 0
-                margin = max(z_score * error_estimate * step_factor, min_margin)
-                forecast_value = max(ensemble_pred_future[0], margin/2)
-                forecast_values[-1] = forecast_value
-                lower_bounds.append(max(0, forecast_value - margin))
-                upper_bounds.append(forecast_value + margin)
-            else:
-                lower_bounds.append(None)
-                upper_bounds.append(None)
-
-    else:  # Recursive
-        current_data = last_data.copy()
-        prediction_history = []
-        for i in range(forecast_weeks):
-            current_data['week_start'] = forecast_dates[i]
-            current_data['week_start'] = pd.to_datetime(current_data['week_start'])
-            current_data['month'] = current_data['week_start'].dt.month
-            current_data['year'] = current_data['week_start'].dt.year
-            current_data['week_of_year'] = current_data['week_start'].dt.isocalendar().week
-
-            for col in current_data.columns:
-                if current_data[col].dtype.kind in 'fc':
-                    current_data[col] = current_data[col].replace([np.inf, -np.inf], np.nan)
-                    if current_data[col].isna().any():
-                        if current_data[col].notna().any():
-                            current_data[col] = current_data[col].fillna(current_data[col].mean())
-                        else:
-                            current_data[col] = current_data[col].fillna(0)
-
-            X_future = current_data[feature_cols]
-            X_future = X_future.replace([np.inf, -np.inf], np.nan)
-            X_future = X_future.fillna(X_future.mean())
-            X_future_clean = pd.DataFrame(imputer.transform(X_future), columns=feature_cols, index=X_future.index)
-            X_future_clean = X_future_clean.replace([np.inf, -np.inf], np.nan)
-            X_future_clean = X_future_clean.fillna(X_future_clean.mean())
-            if feature_selection_enabled and selector is not None:
-                X_future_sel = selector.transform(X_future_clean)
-            else:
-                X_future_sel = X_future_clean.values
-            X_future_sel = np.nan_to_num(X_future_sel, nan=0.0, posinf=0.0, neginf=0.0)
-
-            pred_lgbm_future = lgbm.predict(X_future_sel)
-            pred_rf_future = rf.predict(X_future_sel)
-            if ensemble_method == "Weighted Average":
-                ensemble_pred_future = (lgbm_weight * pred_lgbm_future) + ((1 - lgbm_weight) * pred_rf_future)
-            else:
-                ensemble_pred_future = (pred_lgbm_future + pred_rf_future) / 2
-
-            forecast_value = ensemble_pred_future[0]
-            if i > 0 and len(prediction_history) > 0:
-                trend_direction = 1 if prediction_history[-1] > prediction_history[0] else -1
-                seasonal_factor = (current_data.get('seasonal_sin', 0) + current_data.get('monthly_sin', 0)) / 2
-                if product == 'HOBC':
-                    rand_factor = np.random.normal(trend_direction * 0.05 + seasonal_factor * 0.03, 0.08)
-                    forecast_value = max(100, forecast_value * (1 + rand_factor))
-                else:
-                    rand_factor = np.random.normal(trend_direction * 0.03 + seasonal_factor * 0.02, 0.05)
-                    forecast_value = max(100, forecast_value * (1 + rand_factor))
-
-            forecast_values.append(forecast_value)
-            prediction_history.append(forecast_value)
-            current_data['sales_volume'] = forecast_value
-
-            if include_confidence:
-                mae = metrics.get('MAE', 0)
-                rmse = metrics.get('RMSE', 0)
-                error_estimate = (0.7 * mae) + (0.3 * rmse)
-                z_score = 1.96
-                if confidence_level == 0.99:
-                    z_score = 2.58
-                elif confidence_level == 0.9:
-                    z_score = 1.645
-                elif confidence_level == 0.85:
-                    z_score = 1.44
-                elif confidence_level == 0.8:
-                    z_score = 1.28
-                step_factor = 1 + 0.1 * (i + 1)
-                margin = z_score * error_estimate * step_factor
-                lower_bounds.append(max(0, forecast_value - margin))
-                upper_bounds.append(forecast_value + margin)
-            else:
-                lower_bounds.append(None)
-                upper_bounds.append(None)
+        if forecast_method == 'Recursive':
+            history.loc[history.index[-1], 'sales_volume'] = forecast_val
 
     return {
-        'dates': forecast_dates,
-        'dates_str': [d.strftime('%Y-%m-%d') for d in forecast_dates],
-        'values': forecast_values,
+        'dates': dates,
+        'dates_str': [d.strftime('%Y-%m-%d') for d in dates],
+        'values': forecasts,
         'lower_bounds': lower_bounds,
         'upper_bounds': upper_bounds,
         'method': forecast_method,
@@ -2385,106 +2240,22 @@ def main():
                         rf_min_samples_split = params.get("rf_min_samples_split", 2)
                         ensemble_method = params.get("ensemble_method", "Average")
                         lgbm_weight = params.get("lgbm_weight", 0.5)
-                        
-                        # Train-test split based on selected method
-                        if split_method == "Time-based":
-                            split_point = int(len(group_eng) * train_ratio)
-                            train = group_eng.iloc[:split_point]
-                            test = group_eng.iloc[split_point:]
-                            
-                            # Store train/test date ranges for this combination
-                            if 'week_start' in train.columns and len(train) > 0 and len(test) > 0:
-                                train_start_date = train['week_start'].min()
-                                train_end_date = train['week_start'].max()
-                                test_start_date = test['week_start'].min()
-                                test_end_date = test['week_start'].max()
-                        else:  # Random split
-                            train, test = train_test_split(group_eng, train_size=train_ratio, random_state=42)
-                            
-                            # For random split, we can't determine chronological ranges
-                            # but we can still track the number of samples
-                            train_start_date = None
-                            train_end_date = None
-                            test_start_date = None
-                            test_end_date = None
-                        
-                        X_train = train[feature_cols]
-                        y_train = train['sales_volume']
-                        X_test = test[feature_cols]
-                        y_test = test['sales_volume']
-                        
-                        # Impute
-                        imputer = SimpleImputer(strategy='mean')
-                        X_train_clean = pd.DataFrame(imputer.fit_transform(X_train), columns=feature_cols, index=X_train.index)
-                        X_test_clean = pd.DataFrame(imputer.transform(X_test), columns=feature_cols, index=X_test.index)
-                        
-                        # Feature selection
-                        if feature_selection_enabled:
-                            k = min(k_features, len(feature_cols))
-                            selector = SelectKBest(score_func=f_regression, k=k)
-                            X_train_sel = selector.fit_transform(X_train_clean, y_train)
-                            X_test_sel = selector.transform(X_test_clean)
-                            selected_features = X_train_clean.columns[selector.get_support()].tolist()
-                        else:
-                            X_train_sel = X_train_clean.values
-                            X_test_sel = X_test_clean.values
-                            selected_features = X_train_clean.columns.tolist()
-                        
-                        # Ensemble models
-                        lgbm = lgb.LGBMRegressor(
-                            learning_rate=lgbm_learning_rate, 
-                            n_estimators=lgbm_n_estimators, 
-                            max_depth=lgbm_max_depth,
-                            random_state=42
-                        )
-                        rf = RandomForestRegressor(
-                            n_estimators=rf_n_estimators, 
-                            max_depth=rf_max_depth,
-                            min_samples_split=rf_min_samples_split,
-                            random_state=42
-                        )
-                        
-                        lgbm.fit(X_train_sel, y_train)
-                        rf.fit(X_train_sel, y_train)
-                        
-                        pred_lgbm = lgbm.predict(X_test_sel)
-                        pred_rf = rf.predict(X_test_sel)
-                        
-                        # Combine predictions based on ensemble method
-                        if ensemble_method == "Weighted Average":
-                            ensemble_pred = (lgbm_weight * pred_lgbm) + ((1 - lgbm_weight) * pred_rf)
-                        else:  # Simple average
-                            ensemble_pred = (pred_lgbm + pred_rf) / 2
-                        
-                        metrics = evaluate_preds(y_test, ensemble_pred)
-                        
-                        # Store model results
-                        result_data = {
-                            'metrics': metrics,
-                            'y_test': y_test,
-                            'y_pred': ensemble_pred,
-                            'test_data': test,
-                            'selected_features': selected_features,
-                            'models': {
-                                'lgbm': lgbm,
-                                'rf': rf
-                            },
-                            'imputer': imputer,
-                            'selector': selector if feature_selection_enabled else None,
-                            'feature_cols': feature_cols,
-                            'feature_selection_enabled': feature_selection_enabled,
+                        params_dict = {
+                            'feature_selection': feature_selection_enabled,
+                            'k_features': k_features,
+                            'lgbm_learning_rate': lgbm_learning_rate,
+                            'lgbm_n_estimators': lgbm_n_estimators,
+                            'lgbm_max_depth': lgbm_max_depth,
+                            'rf_n_estimators': rf_n_estimators,
+                            'rf_max_depth': rf_max_depth,
+                            'rf_min_samples_split': rf_min_samples_split,
                             'ensemble_method': ensemble_method,
-                            'lgbm_weight': lgbm_weight,
-                            'train_test_dates': {
-                                'train_start_date': train_start_date,
-                                'train_end_date': train_end_date,
-                                'test_start_date': test_start_date,
-                                'test_end_date': test_end_date,
-                                'split_method': split_method
-                            }
+                            'lgbm_weight': lgbm_weight
                         }
-                        
-                        rp_results[(region, product)] = result_data
+                        split_flag = 'time' if split_method == "Time-based" else 'random'
+                        model_bundle = train_models(group_eng, feature_cols, params_dict,
+                                                    train_ratio=train_ratio, split_method=split_flag)
+                        rp_results[(region, product)] = model_bundle
                     
                     # Set progress to 100% when complete
                     progress_bar.progress(100)
