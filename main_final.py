@@ -525,9 +525,9 @@ def enhanced_feature_engineering(df, forecasting_mode=False, random_state=42):
                                        np.nan)
 
     if forecasting_mode:
-        df['weather_factor'] = 1.0
-        df['economic_factor'] = 1.0
-        df['event_factor'] = 1.0
+        df['weather_factor'] = np.random.normal(1, 0.1, len(df))
+        df['economic_factor'] = np.random.normal(1, 0.05, len(df))
+        df['event_factor'] = np.random.normal(1, 0.15, len(df))
     else:
         np.random.seed(random_state)
         df['weather_factor'] = np.random.normal(1, 0.1, len(df))
@@ -948,6 +948,103 @@ def generate_detailed_forecast(res, group_eng, product, forecast_weeks, forecast
         'dates': forecast_dates,
         'dates_str': [d.strftime('%Y-%m-%d') for d in forecast_dates],
         'values': forecast_values,
+        'lower_bounds': lower_bounds,
+        'upper_bounds': upper_bounds,
+        'method': forecast_method,
+        'horizon': forecast_weeks,
+        'confidence_level': confidence_level if include_confidence else None,
+    }
+
+
+def generate_detailed_forecast(res, group_eng, product, forecast_weeks, forecast_method,
+                               include_confidence, confidence_level):
+    """Forecast future sales using updated feature engineering.
+
+    This implementation recomputes features at every forecast step and avoids
+    deterministic external factors. It supports both direct and recursive
+    strategies and provides optional confidence intervals based on holdout
+    metrics.
+    """
+
+    models = res.get('models', {})
+    lgbm = models.get('lgbm')
+    rf = models.get('rf')
+    metrics = res.get('metrics', {})
+    imputer = res.get('imputer')
+    selector = res.get('selector')
+    feature_cols = res.get('feature_cols', [])
+    ensemble_method = res.get('ensemble_method', 'Average')
+    lgbm_weight = res.get('lgbm_weight', 0.5)
+
+    if not feature_cols or lgbm is None or rf is None or imputer is None:
+        return {
+            'dates': [],
+            'dates_str': [],
+            'values': [],
+            'lower_bounds': [],
+            'upper_bounds': [],
+            'method': forecast_method,
+            'horizon': forecast_weeks,
+            'confidence_level': confidence_level if include_confidence else None,
+        }
+
+    history = group_eng.copy()
+    if not pd.api.types.is_datetime64_any_dtype(history['week_start']):
+        history['week_start'] = pd.to_datetime(history['week_start'])
+    history = history.sort_values('week_start')
+
+    last_date = history['week_start'].iloc[-1]
+    forecast_dates = [last_date + timedelta(days=7 * (i + 1)) for i in range(forecast_weeks)]
+
+    forecasts, lower_bounds, upper_bounds = [], [], []
+    z_lookup = {0.99: 2.58, 0.95: 1.96, 0.9: 1.645, 0.85: 1.44, 0.8: 1.28}
+
+    for i, f_date in enumerate(forecast_dates):
+        new_row = history.iloc[-1:].copy()
+        new_row['week_start'] = f_date
+
+        if forecast_method == 'Recursive':
+            history = pd.concat([history, new_row], ignore_index=True)
+            eng = enhanced_feature_engineering(history, forecasting_mode=True)
+        else:  # Direct
+            temp_history = pd.concat([history, new_row], ignore_index=True)
+            eng = enhanced_feature_engineering(temp_history, forecasting_mode=True)
+
+        features = eng[feature_cols].iloc[-1:]
+        features_clean = pd.DataFrame(imputer.transform(features), columns=feature_cols, index=features.index)
+        if selector is not None:
+            features_sel = selector.transform(features_clean)
+        else:
+            features_sel = features_clean.values
+
+        pred_lgbm = lgbm.predict(features_sel)
+        pred_rf = rf.predict(features_sel)
+        if ensemble_method == 'Weighted Average':
+            forecast_val = (lgbm_weight * pred_lgbm) + ((1 - lgbm_weight) * pred_rf)
+        else:
+            forecast_val = (pred_lgbm + pred_rf) / 2
+        forecast_val = float(forecast_val[0])
+        forecasts.append(forecast_val)
+
+        if forecast_method == 'Recursive':
+            history.loc[history.index[-1], 'sales_volume'] = forecast_val
+
+        if include_confidence:
+            mae = metrics.get('MAE', 0)
+            rmse = metrics.get('RMSE', 0)
+            error_estimate = (0.7 * mae) + (0.3 * rmse)
+            z = z_lookup.get(confidence_level, 1.96)
+            margin = z * error_estimate * (1 + 0.1 * (i + 1))
+            lower_bounds.append(max(0, forecast_val - margin))
+            upper_bounds.append(forecast_val + margin)
+        else:
+            lower_bounds.append(None)
+            upper_bounds.append(None)
+
+    return {
+        'dates': forecast_dates,
+        'dates_str': [d.strftime('%Y-%m-%d') for d in forecast_dates],
+        'values': forecasts,
         'lower_bounds': lower_bounds,
         'upper_bounds': upper_bounds,
         'method': forecast_method,
