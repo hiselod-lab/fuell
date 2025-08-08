@@ -487,6 +487,11 @@ st.markdown("""
 def enhanced_feature_engineering(df, forecasting_mode=False, random_state=42):
     """Create deterministic features for model training and forecasting."""
     df = df.copy()
+    if 'week_start' in df.columns:
+        df['week_start'] = pd.to_datetime(df['week_start'])
+        df['week_of_year'] = df['week_start'].dt.isocalendar().week.astype(int)
+        df['month'] = df['week_start'].dt.month
+        df['year'] = df['week_start'].dt.year
     df['price_elasticity'] = np.where(df['avg_price'] != 0,
                                       df['sales_volume'] / df['avg_price'],
                                       np.nan)
