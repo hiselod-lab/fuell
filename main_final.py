@@ -662,10 +662,12 @@ def train_models(df, feature_cols, params, train_ratio=0.8, split_method='time')
     lgbm_full.fit(X_full_sel, df['sales_volume'])
     rf_full.fit(X_full_sel, df['sales_volume'])
 
+    # The forecasting stage selects columns by name using ``selected_features``;
+    # the fitted selector object is not required outside this scope and is
+    # therefore discarded to avoid feature-count mismatches at inference.
     model_bundle = {
         'models': {'lgbm': lgbm_full, 'rf': rf_full},
         'imputer': imputer_full,
-        'selector': selector_full,
         'feature_cols': feature_cols,
         'selected_features': final_features,
         'ensemble_method': params.get('ensemble_method', 'Average'),
@@ -705,8 +707,8 @@ def generate_forecast(model_bundle, history, steps, method='Recursive',
     lgbm = models['lgbm']
     rf = models['rf']
     imputer = model_bundle['imputer']
-    selector = model_bundle['selector']
     feature_cols = model_bundle['feature_cols']
+    selected_features = model_bundle.get('selected_features', feature_cols)
     ensemble_method = model_bundle['ensemble_method']
     lgbm_weight = model_bundle['lgbm_weight']
     residual_std = model_bundle.get('residual_std', 0.0)
@@ -745,10 +747,8 @@ def generate_forecast(model_bundle, history, steps, method='Recursive',
                 features_clean = pd.DataFrame(
                     imputer.transform(features), columns=feature_cols, index=features.index
                 )
-                if selector is not None:
-                    features_sel = selector.transform(features_clean)
-                else:
-                    features_sel = features_clean.values
+                # Select the exact feature subset used during model training
+                features_sel = features_clean[selected_features]
 
                 pred_lgbm = lgbm.predict(features_sel)
                 pred_rf = rf.predict(features_sel)
@@ -782,10 +782,8 @@ def generate_forecast(model_bundle, history, steps, method='Recursive',
             features_clean = pd.DataFrame(
                 imputer.transform(features), columns=feature_cols, index=features.index
             )
-            if selector is not None:
-                features_sel = selector.transform(features_clean)
-            else:
-                features_sel = features_clean.values
+            # Select the exact feature subset used during model training
+            features_sel = features_clean[selected_features]
 
             pred_lgbm = lgbm.predict(features_sel)
             pred_rf = rf.predict(features_sel)
@@ -835,8 +833,8 @@ def generate_detailed_forecast(res, history, product, forecast_weeks, forecast_m
     model_bundle = {
         'models': res.get('models', {}),
         'imputer': res.get('imputer'),
-        'selector': res.get('selector'),
         'feature_cols': res.get('feature_cols', []),
+        'selected_features': res.get('selected_features', []),
         'ensemble_method': res.get('ensemble_method', 'Average'),
         'lgbm_weight': res.get('lgbm_weight', 0.5),
         'residual_std': res.get('residual_std', 0.0),
@@ -2426,7 +2424,6 @@ def main():
                                 'rf': rf_full,
                             },
                             'imputer': imputer_full,
-                            'selector': selector_full,
                             'feature_cols': feature_cols,
                             'feature_selection_enabled': feature_selection_enabled,
                             'ensemble_method': ensemble_method,
