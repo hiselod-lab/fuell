@@ -483,6 +483,9 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ---------- Forecasting utilities ----------
+# Core temporal predictors we always retain through feature selection
+ESSENTIAL_TIME_FEATURES = ["time_idx","week_of_year","month","seasonal_sin","seasonal_cos","quarterly_sin","quarterly_cos","monthly_sin","monthly_cos","trend_factor","trend_squared"]
+
 @st.cache_data
 def enhanced_feature_engineering(df, forecasting_mode=False, random_state=42):
     """Create deterministic features for model training and forecasting.
@@ -587,10 +590,15 @@ def train_models(df, feature_cols, params, train_ratio=0.8, split_method='time')
     selector = None
     if params.get('feature_selection', True):
         k = min(params.get('k_features', 20), len(feature_cols))
-        selector = SelectKBest(f_regression, k=k)
-        X_train_sel = selector.fit_transform(X_train_clean, y_train)
-        X_test_sel = selector.transform(X_test_clean)
-        selected_features = [feature_cols[i] for i in selector.get_support(indices=True)]
+        selector = SelectKBest(f_regression, k=k).fit(X_train_clean, y_train)
+        idx = list(selector.get_support(indices=True))
+        # Always retain essential temporal features so forecasts can evolve
+        for feat in ESSENTIAL_TIME_FEATURES:
+            if feat in feature_cols and feature_cols.index(feat) not in idx:
+                idx.append(feature_cols.index(feat))
+        selected_features = [feature_cols[i] for i in sorted(idx)]
+        X_train_sel = X_train_clean[selected_features]
+        X_test_sel = X_test_clean[selected_features]
     else:
         X_train_sel, X_test_sel = X_train_clean.values, X_test_clean.values
         selected_features = feature_cols
@@ -627,9 +635,13 @@ def train_models(df, feature_cols, params, train_ratio=0.8, split_method='time')
     X_full = df[feature_cols]
     X_full_clean = pd.DataFrame(imputer_full.fit_transform(X_full), columns=feature_cols, index=df.index)
     if selector is not None:
-        selector_full = SelectKBest(f_regression, k=len(selected_features))
-        X_full_sel = selector_full.fit_transform(X_full_clean, df['sales_volume'])
-        final_features = [feature_cols[i] for i in selector_full.get_support(indices=True)]
+        selector_full = SelectKBest(f_regression, k=len(selected_features)).fit(X_full_clean, df['sales_volume'])
+        idx_full = list(selector_full.get_support(indices=True))
+        for feat in ESSENTIAL_TIME_FEATURES:
+            if feat in feature_cols and feature_cols.index(feat) not in idx_full:
+                idx_full.append(feature_cols.index(feat))
+        final_features = [feature_cols[i] for i in sorted(idx_full)]
+        X_full_sel = X_full_clean[final_features]
     else:
         selector_full = None
         X_full_sel = X_full_clean.values
@@ -1873,10 +1885,14 @@ def main():
                     # Feature selection
                     if feature_selection_enabled:
                         k = min(k_features, len(feature_cols))
-                        selector = SelectKBest(score_func=f_regression, k=k)
-                        X_train_sel = selector.fit_transform(X_train_clean, y_train)
-                        X_test_sel = selector.transform(X_test_clean)
-                        selected_features = [feature_cols[i] for i in selector.get_support(indices=True)]
+                        selector = SelectKBest(score_func=f_regression, k=k).fit(X_train_clean, y_train)
+                        idx = list(selector.get_support(indices=True))
+                        for feat in ESSENTIAL_TIME_FEATURES:
+                            if feat in feature_cols and feature_cols.index(feat) not in idx:
+                                idx.append(feature_cols.index(feat))
+                        selected_features = [feature_cols[i] for i in sorted(idx)]
+                        X_train_sel = X_train_clean[selected_features]
+                        X_test_sel = X_test_clean[selected_features]
                     else:
                         # Use all features
                         X_train_sel = X_train_clean.values
@@ -2313,15 +2329,18 @@ def main():
                         # Feature selection
                         if feature_selection_enabled:
                             k = min(k_features, len(feature_cols))
-                            selector = SelectKBest(score_func=f_regression, k=k)
-                            X_train_sel = selector.fit_transform(X_train_clean, y_train)
-                            X_test_sel = selector.transform(X_test_clean)
-                            selected_features = X_train_clean.columns[selector.get_support()].tolist()
+                            selector = SelectKBest(score_func=f_regression, k=k).fit(X_train_clean, y_train)
+                            idx = list(selector.get_support(indices=True))
+                            for feat in ESSENTIAL_TIME_FEATURES:
+                                if feat in feature_cols and feature_cols.index(feat) not in idx:
+                                    idx.append(feature_cols.index(feat))
+                            selected_features = [feature_cols[i] for i in sorted(idx)]
+                            X_train_sel = X_train_clean[selected_features]
+                            X_test_sel = X_test_clean[selected_features]
                         else:
                             X_train_sel = X_train_clean.values
                             X_test_sel = X_test_clean.values
                             selected_features = X_train_clean.columns.tolist()
-                        
                         # Ensemble models
                         lgbm = lgb.LGBMRegressor(
                             learning_rate=lgbm_learning_rate, 
@@ -2367,9 +2386,13 @@ def main():
 
                         if feature_selection_enabled:
                             k = min(k_features, len(feature_cols))
-                            selector_full = SelectKBest(score_func=f_regression, k=k)
-                            X_full_sel = selector_full.fit_transform(X_full_clean, group_eng['sales_volume'])
-                            final_features = X_full_clean.columns[selector_full.get_support()].tolist()
+                            selector_full = SelectKBest(score_func=f_regression, k=k).fit(X_full_clean, group_eng['sales_volume'])
+                            idx_full = list(selector_full.get_support(indices=True))
+                            for feat in ESSENTIAL_TIME_FEATURES:
+                                if feat in feature_cols and feature_cols.index(feat) not in idx_full:
+                                    idx_full.append(feature_cols.index(feat))
+                            final_features = [feature_cols[i] for i in sorted(idx_full)]
+                            X_full_sel = X_full_clean[final_features]
                         else:
                             selector_full = None
                             X_full_sel = X_full_clean.values
