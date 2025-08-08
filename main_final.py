@@ -4,6 +4,7 @@ import numpy as np
 from sklearn.impute import SimpleImputer
 from sklearn.feature_selection import SelectKBest, f_regression
 from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
 import lightgbm as lgb
 from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error, r2_score
 import plotly.graph_objects as go
@@ -481,17 +482,11 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ---------- Utility functions (copied from main.py) ----------
+# ---------- Forecasting utilities ----------
 @st.cache_data
-def smape(a, f):
-    denom = (np.abs(a) + np.abs(f))
-    mask = denom != 0
-    return 100 * np.mean(2 * np.abs(a[mask] - f[mask]) / denom[mask])
-
-@st.cache_data
-def enhanced_feature_engineering(df, forecasting_mode=False):
+def enhanced_feature_engineering(df, forecasting_mode=False, random_state=42):
+    """Create deterministic features for model training and forecasting."""
     df = df.copy()
-    # Price elasticity and volatility
     df['price_elasticity'] = np.where(df['avg_price'] != 0,
                                       df['sales_volume'] / df['avg_price'],
                                       np.nan)
@@ -500,7 +495,6 @@ def enhanced_feature_engineering(df, forecasting_mode=False):
     )
     df['price_change'] = df['avg_price'].pct_change()
 
-    # Volume trends and volatility
     df['volume_trend'] = df.groupby(['Region', 'Product'])['sales_volume'].transform(
         lambda x: x.rolling(8, min_periods=1).mean()
     )
@@ -509,17 +503,15 @@ def enhanced_feature_engineering(df, forecasting_mode=False):
         lambda x: x.rolling(4, min_periods=1).std()
     )
 
-    # Enhanced seasonal / trend features
     df['seasonal_sin'] = np.sin(2 * np.pi * df['week_of_year'] / 52)
     df['seasonal_cos'] = np.cos(2 * np.pi * df['week_of_year'] / 52)
     df['quarterly_sin'] = np.sin(2 * np.pi * df['week_of_year'] / 13)
-    df['quarterly_cos'] = np.cos(2 * np.pi * df['week_of_year'] / 13)  # Add quarterly cosine
-    df['monthly_sin'] = np.sin(2 * np.pi * df['month'] / 12)  # Add monthly sine
-    df['monthly_cos'] = np.cos(2 * np.pi * df['month'] / 12)  # Add monthly cosine
+    df['quarterly_cos'] = np.cos(2 * np.pi * df['week_of_year'] / 13)
+    df['monthly_sin'] = np.sin(2 * np.pi * df['month'] / 12)
+    df['monthly_cos'] = np.cos(2 * np.pi * df['month'] / 12)
     df['trend_factor'] = df['week_of_year'] / 52
     df['trend_squared'] = (df['week_of_year'] / 52) ** 2
 
-    # Regional and product rolling trends
     df['regional_trend'] = df.groupby('Region')['sales_volume'].transform(
         lambda x: x.rolling(12, min_periods=1).mean()
     )
@@ -527,22 +519,21 @@ def enhanced_feature_engineering(df, forecasting_mode=False):
         lambda x: x.rolling(12, min_periods=1).mean()
     )
 
-    # Interaction features
     df['price_volume_ratio'] = df['avg_price'] * df['sales_volume']
     df['price_over_volume'] = np.where(df['sales_volume'] != 0,
                                        df['avg_price'] / df['sales_volume'],
                                        np.nan)
 
-    # External factors
-    # Remove fixed seed to allow for true randomness in forecasting
-    # Only use fixed seed during initial feature engineering, not during forecasting
-    if not forecasting_mode:
-        np.random.seed(42)  # Keep deterministic behavior for initial data processing
-    df['weather_factor'] = np.random.normal(1, 0.1, len(df))
-    df['economic_factor'] = np.random.normal(1, 0.05, len(df))
-    df['event_factor'] = np.random.normal(1, 0.15, len(df))
+    if forecasting_mode:
+        df['weather_factor'] = 1.0
+        df['economic_factor'] = 1.0
+        df['event_factor'] = 1.0
+    else:
+        np.random.seed(random_state)
+        df['weather_factor'] = np.random.normal(1, 0.1, len(df))
+        df['economic_factor'] = np.random.normal(1, 0.05, len(df))
+        df['event_factor'] = np.random.normal(1, 0.15, len(df))
 
-    # Additional rolling stats on sales_volume
     for window in [4, 8, 12]:
         df[f'roll{window}_mean'] = df.groupby(['Region', 'Product'])['sales_volume'].transform(
             lambda x: x.rolling(window, min_periods=1).mean()
@@ -559,17 +550,163 @@ def evaluate_preds(y_true, y_pred):
     mape = mean_absolute_percentage_error(y_true, y_pred)
     rmse = np.sqrt(np.mean((y_true - y_pred) ** 2))
     r2 = r2_score(y_true, y_pred)
-    smape_val = smape(y_true.values, y_pred)
-    return {
-        'MAE': mae,
-        'MAPE': mape,
-        'RMSE': rmse,
-        'R2': r2,
-        'SMAPE': smape_val
-    }
+    denom = (np.abs(y_true) + np.abs(y_pred)) / 2
+    smape = np.mean(np.abs(y_true - y_pred) / np.where(denom == 0, 1, denom))
+    return {'MAE': mae, 'MAPE': mape, 'RMSE': rmse, 'R2': r2, 'SMAPE': smape}
 
-def generate_forecast(res, group_eng, product, forecast_weeks, forecast_method,
-                      include_confidence, confidence_level):
+def train_models(df, feature_cols, params, train_ratio=0.8, split_method='time'):
+    if split_method == 'time':
+        split_point = int(len(df) * train_ratio)
+        train = df.iloc[:split_point]
+        test = df.iloc[split_point:]
+    else:
+        train, test = train_test_split(df, train_size=train_ratio, random_state=42, shuffle=True)
+
+    X_train, y_train = train[feature_cols], train['sales_volume']
+    X_test, y_test = test[feature_cols], test['sales_volume']
+
+    imputer = SimpleImputer(strategy='mean')
+    X_train_clean = pd.DataFrame(imputer.fit_transform(X_train), columns=feature_cols, index=X_train.index)
+    X_test_clean = pd.DataFrame(imputer.transform(X_test), columns=feature_cols, index=X_test.index)
+
+    selector = None
+    if params.get('feature_selection', True):
+        k = min(params.get('k_features', 20), len(feature_cols))
+        selector = SelectKBest(f_regression, k=k)
+        X_train_sel = selector.fit_transform(X_train_clean, y_train)
+        X_test_sel = selector.transform(X_test_clean)
+        selected_features = [feature_cols[i] for i in selector.get_support(indices=True)]
+    else:
+        X_train_sel, X_test_sel = X_train_clean.values, X_test_clean.values
+        selected_features = feature_cols
+
+    lgbm = lgb.LGBMRegressor(
+        learning_rate=params.get('lgbm_learning_rate', 0.01),
+        n_estimators=params.get('lgbm_n_estimators', 1000),
+        max_depth=params.get('lgbm_max_depth', 7),
+        random_state=42
+    )
+    rf = RandomForestRegressor(
+        n_estimators=params.get('rf_n_estimators', 200),
+        max_depth=params.get('rf_max_depth', 10),
+        min_samples_split=params.get('rf_min_samples_split', 2),
+        random_state=42
+    )
+
+    lgbm.fit(X_train_sel, y_train)
+    rf.fit(X_train_sel, y_train)
+
+    pred_lgbm = lgbm.predict(X_test_sel)
+    pred_rf = rf.predict(X_test_sel)
+    if params.get('ensemble_method', 'Average') == 'Weighted Average':
+        weight = params.get('lgbm_weight', 0.5)
+        ensemble_pred = weight * pred_lgbm + (1 - weight) * pred_rf
+    else:
+        ensemble_pred = (pred_lgbm + pred_rf) / 2
+
+    metrics = evaluate_preds(y_test, ensemble_pred)
+    residual_std = float(np.std(y_test - ensemble_pred, ddof=1)) if len(y_test) > 1 else 0.0
+
+    # Refit preprocessing and models on full data
+    imputer_full = SimpleImputer(strategy='mean')
+    X_full = df[feature_cols]
+    X_full_clean = pd.DataFrame(imputer_full.fit_transform(X_full), columns=feature_cols, index=df.index)
+    if selector is not None:
+        selector_full = SelectKBest(f_regression, k=len(selected_features))
+        X_full_sel = selector_full.fit_transform(X_full_clean, df['sales_volume'])
+        final_features = [feature_cols[i] for i in selector_full.get_support(indices=True)]
+    else:
+        selector_full = None
+        X_full_sel = X_full_clean.values
+        final_features = feature_cols
+
+    lgbm_full = lgb.LGBMRegressor(
+        learning_rate=params.get('lgbm_learning_rate', 0.01),
+        n_estimators=params.get('lgbm_n_estimators', 1000),
+        max_depth=params.get('lgbm_max_depth', 7),
+        random_state=42
+    )
+    rf_full = RandomForestRegressor(
+        n_estimators=params.get('rf_n_estimators', 200),
+        max_depth=params.get('rf_max_depth', 10),
+        min_samples_split=params.get('rf_min_samples_split', 2),
+        random_state=42
+    )
+    lgbm_full.fit(X_full_sel, df['sales_volume'])
+    rf_full.fit(X_full_sel, df['sales_volume'])
+
+    model_bundle = {
+        'models': {'lgbm': lgbm_full, 'rf': rf_full},
+        'imputer': imputer_full,
+        'selector': selector_full,
+        'feature_cols': feature_cols,
+        'selected_features': final_features,
+        'ensemble_method': params.get('ensemble_method', 'Average'),
+        'lgbm_weight': params.get('lgbm_weight', 0.5),
+        'residual_std': residual_std,
+        'metrics': metrics
+    }
+    return model_bundle
+
+def generate_forecast(model_bundle, history, steps, include_confidence=True, confidence_level=0.95):
+    models = model_bundle['models']
+    lgbm = models['lgbm']
+    rf = models['rf']
+    imputer = model_bundle['imputer']
+    selector = model_bundle['selector']
+    feature_cols = model_bundle['feature_cols']
+    ensemble_method = model_bundle['ensemble_method']
+    lgbm_weight = model_bundle['lgbm_weight']
+    residual_std = model_bundle['residual_std']
+
+    history = history.copy().sort_values('week_start')
+    if not pd.api.types.is_datetime64_any_dtype(history['week_start']):
+        history['week_start'] = pd.to_datetime(history['week_start'])
+
+    forecasts, dates, lower, upper = [], [], [], []
+    z_lookup = {0.99: 2.58, 0.95: 1.96, 0.9: 1.645, 0.8: 1.28}
+    z = z_lookup.get(confidence_level, 1.96)
+
+    for _ in range(steps):
+        next_date = history['week_start'].iloc[-1] + timedelta(days=7)
+        new_row = history.iloc[-1:].copy()
+        new_row['week_start'] = next_date
+
+        history = pd.concat([history, new_row], ignore_index=True)
+        eng = enhanced_feature_engineering(history, forecasting_mode=True)
+        features = eng[feature_cols].iloc[-1:]
+
+        features_clean = pd.DataFrame(imputer.transform(features), columns=feature_cols, index=features.index)
+        if selector is not None:
+            features_sel = selector.transform(features_clean)
+        else:
+            features_sel = features_clean.values
+
+        pred_lgbm = lgbm.predict(features_sel)
+        pred_rf = rf.predict(features_sel)
+        if ensemble_method == 'Weighted Average':
+            forecast = lgbm_weight * pred_lgbm + (1 - lgbm_weight) * pred_rf
+        else:
+            forecast = (pred_lgbm + pred_rf) / 2
+        forecasts.append(forecast[0])
+        dates.append(next_date)
+
+        if include_confidence:
+            lower.append(forecast[0] - z * residual_std)
+            upper.append(forecast[0] + z * residual_std)
+
+        history.loc[history.index[-1], 'sales_volume'] = forecast[0]
+
+    result = {
+        'dates': dates,
+        'values': forecasts,
+        'lower_bounds': lower if include_confidence else [],
+        'upper_bounds': upper if include_confidence else [],
+    }
+    return result
+
+def generate_detailed_forecast(res, group_eng, product, forecast_weeks, forecast_method,
+                               include_confidence, confidence_level):
     """Replicate the original detailed forecasting logic.
 
     This function mirrors the extensive forecasting routine previously embedded
@@ -954,7 +1091,6 @@ def create_metrics_dashboard(metrics):
     with col5:
         st.metric("SMAPE", f"{metrics['SMAPE']:.2f}%")
 
-@st.cache_data(ttl=3600)  # Cache for 1 hour to improve performance
 def create_comprehensive_data_overview(df):
     """Create comprehensive data overview with multiple visualizations."""
     
@@ -1011,6 +1147,20 @@ def create_comprehensive_data_overview(df):
         else:
             return str(int(value))
 
+    def generate_log_ticks(max_val: float) -> list:
+        """Generate tick positions for log-scaled axes with custom spacing."""
+        max_val = max(max_val, 2e8)
+        tick_vals = [9e7, 1e8, 2e8]
+        val = 3e8
+        while val <= min(max_val, 9e8):
+            tick_vals.append(val)
+            val += 1e8
+        val = 1e9
+        while val <= max_val:
+            tick_vals.append(val)
+            val += 1e9
+        return tick_vals
+
     # Visualizations
     st.markdown("### 📊 Sales Volume Analysis")
     
@@ -1027,30 +1177,33 @@ def create_comprehensive_data_overview(df):
             'formatted_volume': [format_value_with_unit(val) for val in region_volume.values]
         })
         
+        # Create the base figure
         fig_region = px.bar(
             data_frame=region_df,
             x='Region',
             y='sales_volume',
+            orientation='v',  # Make vertical
             title='Total Weekly Sales Volume by Region',
-            labels={'sales_volume': 'Weekly Sales Volume (Litres)'},
-            color='sales_volume',
-            color_continuous_scale='viridis',
+            labels={'sales_volume': 'Weekly Sales Volume (Litres)', 'Region': 'Region'},
+            color='Region',  # Use Region for coloring
+            color_discrete_map={'South': '#87CEEB'},  # Set custom color for South
+            color_discrete_sequence=px.colors.sequential.Blues[5:],  # Use Blues for other regions
             custom_data='formatted_volume'
         )
         fig_region.update_traces(
             hovertemplate='Region: %{x}<br>Sales Volume: %{y:.2f} (%{customdata})<extra></extra>'
         )
         fig_region.update_layout(
-            height=500,
+            height=1000,
             width=800,
             template='plotly_white',
             font=dict(size=14),
             title_font_size=18,
-            xaxis_title_font_size=14,
-            yaxis_title='Weekly Sales Volume (Litres)',
-            yaxis_title_font_size=14
+            yaxis_title='Sales Volume (Litres)',
+            yaxis_title_font_size=14,
+            coloraxis_showscale=False
         )
-        fig_region.update_xaxes(tickangle=45)
+        fig_region.update_xaxes(categoryorder='total descending')  # Keep the order consistent
         return fig_region
     
     @st.cache_data(ttl=3600)  # Cache for 1 hour
@@ -1068,92 +1221,155 @@ def create_comprehensive_data_overview(df):
 
     @st.cache_data(ttl=3600)
     def create_product_chart(product_df, log_y=False):
+        # Sort products by sales volume (descending) to ensure consistent ordering
+        product_df = product_df.sort_values('sales_volume', ascending=False)
+        
+        # Define a custom color map with professional colors
+        custom_color_map = {
+            'HSD': '#1f77b4',    # Dark blue
+            'PMG': '#d62728',    # Dark red
+            'HOBC': '#2ca02c'    # Dark green
+        }
+        
         fig_product = px.bar(
             data_frame=product_df,
             x='Product',
             y='sales_volume',
+            orientation='v',  # Make vertical
             title='Total Sales Volume by Product',
-            labels={'sales_volume': 'Sales Volume (Litres)'},
-            color='sales_volume',
-            color_continuous_scale='plasma',
+            labels={'sales_volume': 'Sales Volume (Litres)', 'Product': 'Fuel Type'},
+            color='Product',
+            color_discrete_map=custom_color_map,
             custom_data='formatted_volume',
-            log_y=log_y
+            log_y=log_y  # Use log_y for vertical bars
         )
         fig_product.update_traces(
-            hovertemplate='Product: %{x}<br>Sales Volume: %{y:.2f} (%{customdata})<extra></extra>'
+            hovertemplate='Fuel Type: %{x}<br>Sales Volume: %{y:.2f} (%{customdata})<extra></extra>'
         )
         fig_product.update_layout(
-            height=500,
-            width=800,
+            height=800,
+            width=500,
             template='plotly_white',
-            font=dict(size=14),
+            font=dict(size=16),
             title_font_size=18,
-            xaxis_title_font_size=14,
             yaxis_title='Sales Volume (Litres)',
             yaxis_title_font_size=14,
             coloraxis_showscale=False
         )
         if log_y:
+            # Find the minimum value to ensure all products are visible
+            min_vals = product_df.groupby('Product')['sales_volume'].min()
+            # Get the minimum value specifically for HOBC
+            hobc_min = min_vals.get('HOBC', min_vals.min())
+            # Use a lower minimum to ensure HOBC is visible
+            overall_min = min(hobc_min * 0.5, 1e7)
+            
             max_val = product_df['sales_volume'].max()
-            tick_vals = [9e7] + [1e8 * i for i in range(1, int(max_val / 1e8) + 2)]
-            tick_text = [format_tick(v) for v in tick_vals]
-            fig_product.update_yaxes(tickvals=tick_vals, ticktext=tick_text)
-        fig_product.update_xaxes(tickangle=45)
+            tick_vals = generate_log_ticks(max_val)
+            tick_text = [format_tick(v) + '        ' for v in tick_vals]  # Add more space after each label
+            axis_max = tick_vals[-1]
+            
+            # Set a lower range to ensure all products are visible
+            log_min = np.log10(overall_min)
+            
+            fig_product.update_yaxes(
+                tickmode='array',
+                tickvals=tick_vals,
+                ticktext=tick_text,
+                range=[log_min, np.log10(axis_max)],
+                tickfont=dict(size=16),  # Increase font size further
+                ticksuffix='        '  # Add more space after labels
+            )
         return fig_product
 
     @st.cache_data(ttl=3600)
     def create_region_product_chart(df, log_y=False):
+        # Calculate total volume by region for sorting
+        region_totals = df.groupby('Region')['sales_volume'].sum().sort_values(ascending=False)
+        region_order = region_totals.index.tolist()
+        
+        # Group data and calculate volumes
         rp_data = df.groupby(['Region', 'Product'])['sales_volume'].sum().reset_index()
         rp_data['formatted_volume'] = rp_data['sales_volume'].apply(format_value_with_unit)
+        
+        # Sort by the predefined region order
+        rp_data['Region'] = pd.Categorical(rp_data['Region'], categories=region_order, ordered=True)
+        rp_data = rp_data.sort_values('Region')
+        
+        # Define a custom color map with darker colors for better visibility
+        custom_color_map = {
+            'HSD': '#1f77b4',    # Dark blue
+            'PMG': '#d62728',    # Dark red
+            'HOBC': '#2ca02c'    # Dark green
+        }
+        
         fig_rp = px.bar(
             rp_data,
             x='Region',
             y='sales_volume',
             color='Product',
             barmode='group',
+            orientation='v',  # Make vertical
             title='Sales Volume by Region and Product',
-            labels={'sales_volume': 'Sales Volume (Litres)'},
+            labels={'sales_volume': 'Sales Volume (Litres)', 'Region': 'Region', 'Product': 'Fuel Type'},
             custom_data='formatted_volume',
-            log_y=log_y
+            log_y=log_y,  # Use log_y for vertical bars
+            color_discrete_map=custom_color_map  # Use custom color map
         )
         fig_rp.update_traces(
-            hovertemplate='Region: %{x}<br>Product: %{fullData.name}<br>Sales Volume: %{y:.2f} (%{customdata})<extra></extra>'
+            hovertemplate='Region: %{x}<br>Fuel Type: %{fullData.name}<br>Sales Volume: %{y:.2f} (%{customdata})<extra></extra>'
         )
         fig_rp.update_layout(
-            height=600,
+            height=1000,
             width=800,
             template='plotly_white',
-            yaxis_title='Sales Volume (Litres)'
+            yaxis_title='Sales Volume (Litres)',
+            font=dict(size=12)
         )
         if log_y:
+            # Find the minimum value to ensure all products are visible
+            product_mins = rp_data.groupby('Product')['sales_volume'].min()
+            # Get the minimum value specifically for HOBC
+            hobc_min = product_mins.get('HOBC', product_mins.min())
+            # Use a lower minimum to ensure HOBC is visible
+            overall_min = min(hobc_min * 0.5, 1e7)
+            
             max_val = rp_data['sales_volume'].max()
-            tick_vals = [9e7] + [1e8 * i for i in range(1, int(max_val / 1e8) + 2)]
-            tick_text = [format_tick(v) for v in tick_vals]
-            fig_rp.update_yaxes(tickvals=tick_vals, ticktext=tick_text)
-        fig_rp.update_xaxes(tickangle=45)
+            tick_vals = generate_log_ticks(max_val)
+            tick_text = [format_tick(v) + '        ' for v in tick_vals]  # Add more space after each label
+            axis_max = tick_vals[-1]
+            
+            # Set a lower range to ensure all products are visible
+            log_min = np.log10(overall_min)
+            
+            fig_rp.update_yaxes(
+                tickmode='array',
+                tickvals=tick_vals,
+                ticktext=tick_text,
+                range=[log_min, np.log10(axis_max)],
+                tickfont=dict(size=16),  # Increase font size
+                ticksuffix='            '  # Add more space after labels
+            )
         return fig_rp
 
     tab_region, tab_product, tab_region_product = st.tabs(["By Region", "By Product", "Region vs Product"])
+    
     with tab_region:
         fig_region = create_region_volume_chart(df)
         st.plotly_chart(fig_region, use_container_width=True)
+    
     with tab_product:
+        # Create toggle widget inside the tab
+        show_lagged_product = st.toggle("Show logarithmic scale", key="product_lagged", help="Toggle to view data in logarithmic scale")
         product_df = create_product_volume_chart(df)
-        sub_normal, sub_lagged = st.tabs(["Normal", "Lagged"])
-        with sub_normal:
-            fig_product = create_product_chart(product_df)
-            st.plotly_chart(fig_product, use_container_width=True)
-        with sub_lagged:
-            fig_product_lag = create_product_chart(product_df, log_y=True)
-            st.plotly_chart(fig_product_lag, use_container_width=True)
+        fig_product = create_product_chart(product_df, log_y=show_lagged_product)
+        st.plotly_chart(fig_product, use_container_width=True)
+    
     with tab_region_product:
-        rp_normal, rp_lagged = st.tabs(["Normal", "Lagged"])
-        with rp_normal:
-            fig_rp = create_region_product_chart(df)
-            st.plotly_chart(fig_rp, use_container_width=True)
-        with rp_lagged:
-            fig_rp_log = create_region_product_chart(df, log_y=True)
-            st.plotly_chart(fig_rp_log, use_container_width=True)
+        # Create toggle widget inside the tab
+        show_lagged_rp = st.toggle("Show logarithmic scale", key="rp_lagged", help="Toggle to view data in logarithmic scale")
+        fig_rp = create_region_product_chart(df, log_y=show_lagged_rp)
+        st.plotly_chart(fig_rp, use_container_width=True)
 
     # Time series analysis
     st.markdown("### 📈 Monthly Sales Volume Trend")
@@ -1171,7 +1387,15 @@ def create_comprehensive_data_overview(df):
         )
         df_monthly['week_start'] = df_monthly['week_start'].astype(str)
         df_monthly['formatted_volume'] = df_monthly['sales_volume'].apply(format_value_with_unit)
+        
+        # Define a custom color map with darker, professional colors
+        custom_color_map = {
+            'HSD': '#1f77b4',    # Dark blue
+            'PMG': '#d62728',    # Dark red
+            'HOBC': '#2ca02c'    # Dark green
+        }
 
+        # Create trend line without markers for cleaner visualization
         fig_monthly = px.line(
             df_monthly,
             x='week_start',
@@ -1180,31 +1404,72 @@ def create_comprehensive_data_overview(df):
             title='Monthly Sales Volume Trend by Fuel Type',
             labels={'week_start': 'Month', 'sales_volume': 'Monthly Sales Volume (Litres)', 'Product': 'Fuel Type'},
             custom_data='formatted_volume',
-            log_y=log_y
+            log_y=log_y,
+            color_discrete_map=custom_color_map,  # Use custom color map
+            line_shape='spline',  # Use spline for smoother trend lines
+            markers=False  # Remove markers to show clean trend lines
         )
+        
+        # Update line thickness for better visibility
         fig_monthly.update_traces(
+            line=dict(width=4),  # Thicker lines for better trend visibility
             hovertemplate='Month: %{x}<br>Fuel Type: %{fullData.name}<br>Monthly Sales Volume: %{y:.2f} (%{customdata})<extra></extra>'
         )
+        
         fig_monthly.update_layout(
-            height=450,
+            height=700,
             width=800,
-            template='plotly_white'
+            template='plotly_white',
+            font=dict(size=14),
+            legend=dict(font=dict(size=16)),  # Larger legend font
+            margin=dict(l=100, r=100, t=70, b=70),  # Increase left and right margins for y-axis labels
+            yaxis=dict(title_standoff=60)  # Increase distance between axis title and tick labels
         )
+        
         if log_y:
+            # Find the minimum value for each product to ensure all are visible
+            min_vals = df_monthly.groupby('Product')['sales_volume'].min()
+            
+            # Get the minimum value specifically for HOBC and ensure it's properly handled
+            hobc_min = min_vals.get('HOBC', min_vals.min())
+            
+            # Use a much lower minimum to ensure HOBC is visible - go even lower than before
+            overall_min = min(hobc_min * 0.1, 1e6)  # Ensure we go extremely low for HOBC
+            
             max_val = df_monthly['sales_volume'].max()
-            tick_vals = [9e7] + [1e8 * i for i in range(1, int(max_val / 1e8) + 2)]
-            tick_text = [format_tick(v) for v in tick_vals]
-            fig_monthly.update_yaxes(tickvals=tick_vals, ticktext=tick_text)
+            
+            # Generate custom tick values that include the range for all products
+            # Start with very low values to ensure HOBC is visible
+            base_ticks = [1e6, 5e6, 1e7, 5e7] + generate_log_ticks(max_val)
+            tick_vals = sorted(list(set(base_ticks)))  # Remove duplicates and sort
+            
+            # Add more space after each label
+            tick_text = [format_tick(v) + '                          ' for v in tick_vals]  # Add much more space
+            axis_max = tick_vals[-1]
+            
+            # Set a much lower range to ensure HOBC is visible
+            log_min = np.log10(overall_min)  # Ensure we go low enough for HOBC
+            
+            fig_monthly.update_yaxes(
+                tickmode='array',
+                tickvals=tick_vals,
+                ticktext=tick_text,
+                range=[log_min, np.log10(axis_max)],
+                tickfont=dict(size=16),  # Increase font size further
+                ticksuffix='                          ',  # Add much more space after labels
+                showgrid=True,  # Show grid lines for better readability
+                gridwidth=1,
+                gridcolor='rgba(211, 211, 211, 0.5)',  # Light gray grid lines
+                title_standoff=30  # Increase distance between axis title and labels
+            )
+        
         fig_monthly.update_xaxes(tickangle=45)
         return fig_monthly
 
-    month_normal, month_lagged = st.tabs(["Normal", "Lagged"])
-    with month_normal:
-        fig_monthly = create_monthly_sales_chart(df)
-        st.plotly_chart(fig_monthly, use_container_width=True)
-    with month_lagged:
-        fig_monthly_log = create_monthly_sales_chart(df, log_y=True)
-        st.plotly_chart(fig_monthly_log, use_container_width=True)
+    # Create toggle widget directly in the flow
+    show_lagged_month = st.toggle("Show logarithmic scale", key="monthly_lagged", help="Toggle to view data in logarithmic scale")
+    fig_monthly = create_monthly_sales_chart(df, log_y=show_lagged_month)
+    st.plotly_chart(fig_monthly, use_container_width=True)
 
     st.markdown("### 💰 Monthly Average Price Trend by Fuel Type")
     
@@ -2656,7 +2921,7 @@ def main():
                             # Use deterministic feature engineering for historical data
                             group_eng = enhanced_feature_engineering(group, forecasting_mode=False)
 
-                            forecast = generate_forecast(
+                            forecast = generate_detailed_forecast(
                                 res,
                                 group_eng,
                                 product,
