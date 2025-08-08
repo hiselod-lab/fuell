@@ -485,60 +485,75 @@ st.markdown("""
 # ---------- Forecasting utilities ----------
 @st.cache_data
 def enhanced_feature_engineering(df, forecasting_mode=False, random_state=42):
-    """Create deterministic features for model training and forecasting."""
+    """Create deterministic features for model training and forecasting.
+
+    Adds lagged sales and temporal indicators so that training and
+    inference share the exact same feature set.
+    """
     df = df.copy()
-    df['price_elasticity'] = np.where(df['avg_price'] != 0,
-                                      df['sales_volume'] / df['avg_price'],
-                                      np.nan)
-    df['price_volatility'] = df.groupby(['Region', 'Product'])['avg_price'].transform(
+    df = df.sort_values("week_start").reset_index(drop=True)
+
+    # ------------------------------------------------------------------
+    # Basic autoregressive structure
+    # ------------------------------------------------------------------
+    for lag in [1, 2, 4]:
+        df[f"lag_{lag}"] = df.groupby(["Region", "Product"])["sales_volume"].shift(lag)
+
+    df["price_pct_change"] = df.groupby(["Region", "Product"])["avg_price"].pct_change()
+    df["weeks_since_price_change"] = df.groupby(["Region", "Product"])["avg_price"].transform(
+        lambda x: x.groupby((x != x.shift()).cumsum()).cumcount()
+    )
+    df["quarter"] = pd.to_datetime(df["week_start"]).dt.quarter
+    if "is_holiday_week" not in df.columns:
+        df["is_holiday_week"] = 0
+
+    df["price_elasticity"] = np.where(df["avg_price"] != 0, df["sales_volume"] / df["avg_price"], np.nan)
+    df["price_volatility"] = df.groupby(["Region", "Product"])["avg_price"].transform(
         lambda x: x.rolling(4, min_periods=1).std()
     )
-    df['price_change'] = df['avg_price'].pct_change()
 
-    df['volume_trend'] = df.groupby(['Region', 'Product'])['sales_volume'].transform(
+    df["volume_trend"] = df.groupby(["Region", "Product"])["sales_volume"].transform(
         lambda x: x.rolling(8, min_periods=1).mean()
     )
-    df['volume_change'] = df['sales_volume'].pct_change()
-    df['volume_volatility'] = df.groupby(['Region', 'Product'])['sales_volume'].transform(
+    df["volume_change"] = df["sales_volume"].pct_change()
+    df["volume_volatility"] = df.groupby(["Region", "Product"])["sales_volume"].transform(
         lambda x: x.rolling(4, min_periods=1).std()
     )
 
-    df['seasonal_sin'] = np.sin(2 * np.pi * df['week_of_year'] / 52)
-    df['seasonal_cos'] = np.cos(2 * np.pi * df['week_of_year'] / 52)
-    df['quarterly_sin'] = np.sin(2 * np.pi * df['week_of_year'] / 13)
-    df['quarterly_cos'] = np.cos(2 * np.pi * df['week_of_year'] / 13)
-    df['monthly_sin'] = np.sin(2 * np.pi * df['month'] / 12)
-    df['monthly_cos'] = np.cos(2 * np.pi * df['month'] / 12)
-    df['trend_factor'] = df['week_of_year'] / 52
-    df['trend_squared'] = (df['week_of_year'] / 52) ** 2
+    # ------------------------------------------------------------------
+    # Seasonal and long-term signals
+    # ------------------------------------------------------------------
+    df["seasonal_sin"] = np.sin(2 * np.pi * df["week_of_year"] / 52)
+    df["seasonal_cos"] = np.cos(2 * np.pi * df["week_of_year"] / 52)
+    df["quarterly_sin"] = np.sin(2 * np.pi * df["week_of_year"] / 13)
+    df["quarterly_cos"] = np.cos(2 * np.pi * df["week_of_year"] / 13)
+    df["monthly_sin"] = np.sin(2 * np.pi * df["month"] / 12)
+    df["monthly_cos"] = np.cos(2 * np.pi * df["month"] / 12)
+    df["trend_factor"] = df["week_of_year"] / 52
+    df["trend_squared"] = (df["week_of_year"] / 52) ** 2
+    # monotonically increasing counter per region-product so model can learn long-term trend
+    df["time_idx"] = df.groupby(["Region", "Product"]).cumcount()
 
-    df['regional_trend'] = df.groupby('Region')['sales_volume'].transform(
+    df["regional_trend"] = df.groupby("Region")["sales_volume"].transform(
         lambda x: x.rolling(12, min_periods=1).mean()
     )
-    df['product_trend'] = df.groupby('Product')['sales_volume'].transform(
+    df["product_trend"] = df.groupby("Product")["sales_volume"].transform(
         lambda x: x.rolling(12, min_periods=1).mean()
     )
 
-    df['price_volume_ratio'] = df['avg_price'] * df['sales_volume']
-    df['price_over_volume'] = np.where(df['sales_volume'] != 0,
-                                       df['avg_price'] / df['sales_volume'],
-                                       np.nan)
+    df["price_volume_ratio"] = df["avg_price"] * df["sales_volume"]
+    df["price_over_volume"] = np.where(df["sales_volume"] != 0, df["avg_price"] / df["sales_volume"], np.nan)
 
-    if forecasting_mode:
-        df['weather_factor'] = 1.0
-        df['economic_factor'] = 1.0
-        df['event_factor'] = 1.0
-    else:
-        np.random.seed(random_state)
-        df['weather_factor'] = np.random.normal(1, 0.1, len(df))
-        df['economic_factor'] = np.random.normal(1, 0.05, len(df))
-        df['event_factor'] = np.random.normal(1, 0.15, len(df))
+    # deterministic placeholders to keep training and forecasting distributions identical
+    df["weather_factor"] = 1.0
+    df["economic_factor"] = 1.0
+    df["event_factor"] = 1.0
 
     for window in [4, 8, 12]:
-        df[f'roll{window}_mean'] = df.groupby(['Region', 'Product'])['sales_volume'].transform(
+        df[f"roll{window}_mean"] = df.groupby(["Region", "Product"])["sales_volume"].transform(
             lambda x: x.rolling(window, min_periods=1).mean()
         )
-        df[f'roll{window}_std'] = df.groupby(['Region', 'Product'])['sales_volume'].transform(
+        df[f"roll{window}_std"] = df.groupby(["Region", "Product"])["sales_volume"].transform(
             lambda x: x.rolling(window, min_periods=1).std()
         )
 
@@ -648,7 +663,32 @@ def train_models(df, feature_cols, params, train_ratio=0.8, split_method='time')
     }
     return model_bundle
 
-def generate_forecast(model_bundle, history, steps, include_confidence=True, confidence_level=0.95):
+def generate_forecast(model_bundle, history, steps, method='Recursive',
+                      include_confidence=True, confidence_level=0.95):
+    """Generate multi-step forecasts using direct or recursive strategy.
+
+    The *direct* approach internally performs a recursive simulation for each
+    forecast horizon so that lagged features incorporate prior predictions.
+    This helps the model follow historical trends instead of emitting a flat
+    line. The *recursive* approach updates the history in-place after every
+    predicted step.
+
+    Parameters
+    ----------
+    model_bundle : dict
+        Trained models and preprocessing artifacts.
+    history : pd.DataFrame
+        Historical data including ``week_start`` and ``sales_volume``.
+    steps : int
+        Number of weeks to forecast.
+    method : str, optional
+        Either ``'Direct'`` or ``'Recursive'`` (case insensitive).
+    include_confidence : bool, optional
+        Whether to include confidence intervals.
+    confidence_level : float, optional
+        Confidence level for the intervals.
+    """
+
     models = model_bundle['models']
     lgbm = models['lgbm']
     rf = models['rf']
@@ -657,7 +697,7 @@ def generate_forecast(model_bundle, history, steps, include_confidence=True, con
     feature_cols = model_bundle['feature_cols']
     ensemble_method = model_bundle['ensemble_method']
     lgbm_weight = model_bundle['lgbm_weight']
-    residual_std = model_bundle['residual_std']
+    residual_std = model_bundle.get('residual_std', 0.0)
 
     history = history.copy().sort_values('week_start')
     if not pd.api.types.is_datetime64_any_dtype(history['week_start']):
@@ -667,293 +707,145 @@ def generate_forecast(model_bundle, history, steps, include_confidence=True, con
     z_lookup = {0.99: 2.58, 0.95: 1.96, 0.9: 1.645, 0.8: 1.28}
     z = z_lookup.get(confidence_level, 1.96)
 
-    for _ in range(steps):
-        next_date = history['week_start'].iloc[-1] + timedelta(days=7)
-        new_row = history.iloc[-1:].copy()
-        new_row['week_start'] = next_date
+    method = method.lower()
 
-        history = pd.concat([history, new_row], ignore_index=True)
-        eng = enhanced_feature_engineering(history, forecasting_mode=True)
-        features = eng[feature_cols].iloc[-1:]
+    if method == 'direct':
+        # ------------------------------------------------------------------
+        # Direct forecasting: for each horizon we simulate recursive steps
+        # from the original history so that feature lags evolve with prior
+        # predictions. This avoids identical forecasts for every step and
+        # better reflects learned temporal patterns.
+        # ------------------------------------------------------------------
+        for step in range(1, steps + 1):
+            temp_history = history.copy()
+            forecast = None
+            for _ in range(step):
+                next_date = temp_history['week_start'].iloc[-1] + timedelta(days=7)
+                new_row = temp_history.iloc[-1:].copy()
+                new_row['week_start'] = next_date
+                # Recompute basic calendar fields so seasonal features evolve
+                new_row['week_of_year'] = new_row['week_start'].dt.isocalendar().week.astype(int)
+                new_row['month'] = new_row['week_start'].dt.month
+                temp_history = pd.concat([temp_history, new_row], ignore_index=True)
 
-        features_clean = pd.DataFrame(imputer.transform(features), columns=feature_cols, index=features.index)
-        if selector is not None:
-            features_sel = selector.transform(features_clean)
-        else:
-            features_sel = features_clean.values
+                eng = enhanced_feature_engineering(temp_history, forecasting_mode=True)
+                features = eng[feature_cols].iloc[-1:]
+                features_clean = pd.DataFrame(
+                    imputer.transform(features), columns=feature_cols, index=features.index
+                )
+                if selector is not None:
+                    features_sel = selector.transform(features_clean)
+                else:
+                    features_sel = features_clean.values
 
-        pred_lgbm = lgbm.predict(features_sel)
-        pred_rf = rf.predict(features_sel)
-        if ensemble_method == 'Weighted Average':
-            forecast = lgbm_weight * pred_lgbm + (1 - lgbm_weight) * pred_rf
-        else:
-            forecast = (pred_lgbm + pred_rf) / 2
-        forecasts.append(forecast[0])
-        dates.append(next_date)
+                pred_lgbm = lgbm.predict(features_sel)
+                pred_rf = rf.predict(features_sel)
+                if ensemble_method == 'Weighted Average':
+                    forecast = lgbm_weight * pred_lgbm + (1 - lgbm_weight) * pred_rf
+                else:
+                    forecast = (pred_lgbm + pred_rf) / 2
 
-        if include_confidence:
-            lower.append(forecast[0] - z * residual_std)
-            upper.append(forecast[0] + z * residual_std)
+                # Use the forecast as the next step's lagged sales volume
+                temp_history.loc[temp_history.index[-1], 'sales_volume'] = forecast[0]
 
-        history.loc[history.index[-1], 'sales_volume'] = forecast[0]
+            forecasts.append(float(forecast[0]))
+            dates.append(next_date)
 
-    result = {
+            if include_confidence:
+                lower.append(forecast[0] - z * residual_std)
+                upper.append(forecast[0] + z * residual_std)
+
+    else:  # recursive
+        for _ in range(steps):
+            next_date = history['week_start'].iloc[-1] + timedelta(days=7)
+            new_row = history.iloc[-1:].copy()
+            new_row['week_start'] = next_date
+            new_row['week_of_year'] = new_row['week_start'].dt.isocalendar().week.astype(int)
+            new_row['month'] = new_row['week_start'].dt.month
+
+            history = pd.concat([history, new_row], ignore_index=True)
+            eng = enhanced_feature_engineering(history, forecasting_mode=True)
+            features = eng[feature_cols].iloc[-1:]
+
+            features_clean = pd.DataFrame(
+                imputer.transform(features), columns=feature_cols, index=features.index
+            )
+            if selector is not None:
+                features_sel = selector.transform(features_clean)
+            else:
+                features_sel = features_clean.values
+
+            pred_lgbm = lgbm.predict(features_sel)
+            pred_rf = rf.predict(features_sel)
+            if ensemble_method == 'Weighted Average':
+                forecast = lgbm_weight * pred_lgbm + (1 - lgbm_weight) * pred_rf
+            else:
+                forecast = (pred_lgbm + pred_rf) / 2
+            forecasts.append(float(forecast[0]))
+            dates.append(next_date)
+
+            if include_confidence:
+                lower.append(forecast[0] - z * residual_std)
+                upper.append(forecast[0] + z * residual_std)
+
+            history.loc[history.index[-1], 'sales_volume'] = forecast[0]
+
+    return {
         'dates': dates,
+        'dates_str': [d.strftime('%Y-%m-%d') for d in dates],
         'values': forecasts,
         'lower_bounds': lower if include_confidence else [],
         'upper_bounds': upper if include_confidence else [],
     }
-    return result
 
-def generate_detailed_forecast(res, group_eng, product, forecast_weeks, forecast_method,
+
+def generate_detailed_forecast(res, history, product, forecast_weeks, forecast_method,
                                include_confidence, confidence_level):
-    """Replicate the original detailed forecasting logic.
+    """Prepare inputs and delegate to :func:`generate_forecast`.
 
-    This function mirrors the extensive forecasting routine previously embedded
-    in the training loop. It regenerates time and seasonal features, applies
-    product-specific randomisation and handles both direct and recursive
-    strategies while optionally producing confidence intervals.
+    Parameters
+    ----------
+    res : dict
+        Trained model artifacts for the region-product combination.
+    history : pd.DataFrame
+        Raw chronological data used to seed the forecast.
+    product : str
+        Fuel type label.
+    forecast_weeks : int
+        Number of weeks to forecast ahead.
+    forecast_method : str
+        Either "Direct" or "Recursive".
+    include_confidence : bool
+        Whether to compute confidence intervals.
+    confidence_level : float
+        Confidence level for the intervals.
     """
+    model_bundle = {
+        'models': res.get('models', {}),
+        'imputer': res.get('imputer'),
+        'selector': res.get('selector'),
+        'feature_cols': res.get('feature_cols', []),
+        'ensemble_method': res.get('ensemble_method', 'Average'),
+        'lgbm_weight': res.get('lgbm_weight', 0.5),
+        'residual_std': res.get('residual_std', 0.0),
+    }
 
-    models = res.get('models', {})
-    lgbm = models.get('lgbm')
-    rf = models.get('rf')
-    metrics = res.get('metrics', {})
-    y_test = res.get('y_test', pd.Series(dtype=float))
-    imputer = res.get('imputer')
-    selector = res.get('selector')
-    feature_cols = res.get('feature_cols', [])
-    selected_features = res.get('selected_features', [])
-    feature_selection_enabled = res.get('feature_selection_enabled', False)
-    ensemble_method = res.get('ensemble_method', 'Average')
-    lgbm_weight = res.get('lgbm_weight', 0.5)
+    forecast = generate_forecast(
+        model_bundle,
+        history,
+        forecast_weeks,
+        method=forecast_method,
+        include_confidence=include_confidence,
+        confidence_level=confidence_level,
+    )
 
-    if not feature_cols or lgbm is None or rf is None or imputer is None:
-        return {
-            'dates': [],
-            'dates_str': [],
-            'values': [],
-            'lower_bounds': [],
-            'upper_bounds': [],
-            'method': forecast_method,
-            'horizon': forecast_weeks,
-            'confidence_level': confidence_level if include_confidence else None,
-        }
-
-    group_eng = group_eng.copy()
-    if not pd.api.types.is_datetime64_any_dtype(group_eng['week_start']):
-        group_eng['week_start'] = pd.to_datetime(group_eng['week_start'])
-
-    last_data = group_eng.iloc[-1:].copy()
-    last_date = pd.to_datetime(last_data['week_start'].iloc[0])
-
-    forecast_dates = [last_date + timedelta(days=7 * i) for i in range(1, forecast_weeks + 1)]
-    forecast_values = []
-    lower_bounds = []
-    upper_bounds = []
-
-    if forecast_method == 'Direct':
-        for i in range(forecast_weeks):
-            future_data = last_data.copy()
-            future_data['week_start'] = forecast_dates[i]
-            future_data['week_start'] = pd.to_datetime(future_data['week_start'])
-            future_data['month'] = future_data['week_start'].dt.month
-            future_data['year'] = future_data['week_start'].dt.year
-            future_data['week_of_year'] = future_data['week_start'].dt.isocalendar().week
-            future_data['seasonal_sin'] = np.sin(2 * np.pi * future_data['week_of_year'] / 52)
-            future_data['seasonal_cos'] = np.cos(2 * np.pi * future_data['week_of_year'] / 52)
-            future_data['quarterly_sin'] = np.sin(2 * np.pi * future_data['week_of_year'] / 13)
-            future_data['quarterly_cos'] = np.cos(2 * np.pi * future_data['week_of_year'] / 13)
-            future_data['monthly_sin'] = np.sin(2 * np.pi * future_data['month'] / 12)
-            future_data['monthly_cos'] = np.cos(2 * np.pi * future_data['month'] / 12)
-            future_data['trend_factor'] = future_data['week_of_year'] / 52
-            future_data['trend_squared'] = (future_data['week_of_year'] / 52) ** 2
-            future_data['price_change'] = 0
-
-            is_hobc = product == 'HOBC'
-            historical_volatility = metrics.get('RMSE', 0) / y_test.mean() if len(y_test) > 0 and y_test.mean() > 0 else 0.05
-            base_variation_factor = max(0.02, historical_volatility * 0.3) * (1 + i * 0.15)
-            if is_hobc:
-                variation_factor = base_variation_factor * 3.0
-                min_absolute_variation = 1000
-            else:
-                variation_factor = base_variation_factor * 1.5
-                min_absolute_variation = 250
-
-            relative_change = np.random.normal(0, variation_factor)
-            future_data['volume_change'] = relative_change
-
-            if len(y_test) > 1:
-                historical_trend = 1 if y_test.iloc[-1] > y_test.iloc[0] else -1
-                trend_strength = min(1.0, abs(y_test.iloc[-1] - y_test.iloc[0]) / (y_test.mean() + 1e-10))
-            else:
-                historical_trend = 1
-                trend_strength = 0.5
-
-            volatility_factor = 0.02 * (i + 1) * (3.0 if is_hobc else 1.0)
-            trend_factor = 0.03 * (i + 1) * (3.0 if is_hobc else 1.0)
-            regional_product_factor = 0.01 * (i + 1) * (3.0 if is_hobc else 1.0)
-            trend_bias = historical_trend * trend_strength * 0.01 * (i + 1)
-
-            future_data['price_volatility'] *= (1 + np.random.normal(trend_bias, volatility_factor))
-            future_data['volume_trend'] *= (1 + np.random.normal(trend_bias * 1.5, trend_factor))
-            future_data['volume_volatility'] *= (1 + np.random.normal(trend_bias, volatility_factor))
-            future_data['regional_trend'] *= (1 + np.random.normal(trend_bias, regional_product_factor))
-            future_data['product_trend'] *= (1 + np.random.normal(trend_bias, regional_product_factor))
-
-            rolling_factor = 0.02 * (i + 1) * (3.0 if is_hobc else 1.0)
-            for window in [4, 8, 12]:
-                if f'roll{window}_mean' in future_data.columns:
-                    window_adjusted_factor = rolling_factor * (1.0 + (1.0 / window))
-                    window_trend_bias = trend_bias * (1.0 + (1.0 / window))
-                    mean_change = np.random.normal(window_trend_bias, window_adjusted_factor)
-                    future_data[f'roll{window}_mean'] *= (1 + mean_change)
-                    if is_hobc:
-                        abs_variation = min_absolute_variation * (1.0 + (0.5 / window))
-                        direction_prob = 0.5 + (0.3 * historical_trend)
-                        direction = np.random.choice([-1, 1], p=[1-direction_prob, direction_prob]) if historical_trend > 0 else np.random.choice([-1, 1], p=[direction_prob, 1-direction_prob])
-                        future_data[f'roll{window}_mean'] += direction * abs_variation
-                    elif min_absolute_variation > 0:
-                        direction_prob = 0.5 + (0.2 * historical_trend)
-                        direction = np.random.choice([-1, 1], p=[1-direction_prob, direction_prob]) if historical_trend > 0 else np.random.choice([-1, 1], p=[direction_prob, 1-direction_prob])
-                        future_data[f'roll{window}_mean'] += direction * min_absolute_variation * (0.5 + (0.2 / window))
-
-                if f'roll{window}_std' in future_data.columns:
-                    std_factor = rolling_factor * (1.0 + historical_volatility)
-                    future_data[f'roll{window}_std'] *= (1 + np.random.normal(0, std_factor))
-                    min_std = min_absolute_variation * 0.2 * historical_volatility if is_hobc else min_absolute_variation * 0.1 * historical_volatility
-                    if min_std > 0:
-                        future_data[f'roll{window}_std'] = future_data[f'roll{window}_std'].clip(lower=min_std)
-
-            X_future = future_data[feature_cols]
-            X_future_clean = pd.DataFrame(imputer.transform(X_future), columns=feature_cols, index=X_future.index)
-            if feature_selection_enabled and selector is not None:
-                X_future_sel = selector.transform(X_future_clean)
-            else:
-                X_future_sel = X_future_clean.values
-            X_future_sel = np.nan_to_num(X_future_sel, nan=0.0, posinf=0.0, neginf=0.0)
-
-            pred_lgbm_future = lgbm.predict(X_future_sel)
-            pred_rf_future = rf.predict(X_future_sel)
-            if ensemble_method == "Weighted Average":
-                ensemble_pred_future = (lgbm_weight * pred_lgbm_future) + ((1 - lgbm_weight) * pred_rf_future)
-            else:
-                ensemble_pred_future = (pred_lgbm_future + pred_rf_future) / 2
-
-            forecast_values.append(ensemble_pred_future[0])
-
-            if include_confidence:
-                mae = metrics.get('MAE', 0)
-                rmse = metrics.get('RMSE', 0)
-                error_estimate = (0.7 * mae) + (0.3 * rmse)
-                z_score = 1.96
-                if confidence_level == 0.99:
-                    z_score = 2.58
-                elif confidence_level == 0.9:
-                    z_score = 1.645
-                elif confidence_level == 0.85:
-                    z_score = 1.44
-                elif confidence_level == 0.8:
-                    z_score = 1.28
-                if is_hobc:
-                    step_factor = 1 + (i * 0.2)
-                    min_margin = 2000 * (i + 1)
-                else:
-                    step_factor = 1 + (i * 0.1)
-                    min_margin = 0
-                margin = max(z_score * error_estimate * step_factor, min_margin)
-                forecast_value = max(ensemble_pred_future[0], margin/2)
-                forecast_values[-1] = forecast_value
-                lower_bounds.append(max(0, forecast_value - margin))
-                upper_bounds.append(forecast_value + margin)
-            else:
-                lower_bounds.append(None)
-                upper_bounds.append(None)
-
-    else:  # Recursive
-        current_data = last_data.copy()
-        prediction_history = []
-        for i in range(forecast_weeks):
-            current_data['week_start'] = forecast_dates[i]
-            current_data['week_start'] = pd.to_datetime(current_data['week_start'])
-            current_data['month'] = current_data['week_start'].dt.month
-            current_data['year'] = current_data['week_start'].dt.year
-            current_data['week_of_year'] = current_data['week_start'].dt.isocalendar().week
-
-            for col in current_data.columns:
-                if current_data[col].dtype.kind in 'fc':
-                    current_data[col] = current_data[col].replace([np.inf, -np.inf], np.nan)
-                    if current_data[col].isna().any():
-                        if current_data[col].notna().any():
-                            current_data[col] = current_data[col].fillna(current_data[col].mean())
-                        else:
-                            current_data[col] = current_data[col].fillna(0)
-
-            X_future = current_data[feature_cols]
-            X_future = X_future.replace([np.inf, -np.inf], np.nan)
-            X_future = X_future.fillna(X_future.mean())
-            X_future_clean = pd.DataFrame(imputer.transform(X_future), columns=feature_cols, index=X_future.index)
-            X_future_clean = X_future_clean.replace([np.inf, -np.inf], np.nan)
-            X_future_clean = X_future_clean.fillna(X_future_clean.mean())
-            if feature_selection_enabled and selector is not None:
-                X_future_sel = selector.transform(X_future_clean)
-            else:
-                X_future_sel = X_future_clean.values
-            X_future_sel = np.nan_to_num(X_future_sel, nan=0.0, posinf=0.0, neginf=0.0)
-
-            pred_lgbm_future = lgbm.predict(X_future_sel)
-            pred_rf_future = rf.predict(X_future_sel)
-            if ensemble_method == "Weighted Average":
-                ensemble_pred_future = (lgbm_weight * pred_lgbm_future) + ((1 - lgbm_weight) * pred_rf_future)
-            else:
-                ensemble_pred_future = (pred_lgbm_future + pred_rf_future) / 2
-
-            forecast_value = ensemble_pred_future[0]
-            if i > 0 and len(prediction_history) > 0:
-                trend_direction = 1 if prediction_history[-1] > prediction_history[0] else -1
-                seasonal_factor = (current_data.get('seasonal_sin', 0) + current_data.get('monthly_sin', 0)) / 2
-                if product == 'HOBC':
-                    rand_factor = np.random.normal(trend_direction * 0.05 + seasonal_factor * 0.03, 0.08)
-                    forecast_value = max(100, forecast_value * (1 + rand_factor))
-                else:
-                    rand_factor = np.random.normal(trend_direction * 0.03 + seasonal_factor * 0.02, 0.05)
-                    forecast_value = max(100, forecast_value * (1 + rand_factor))
-
-            forecast_values.append(forecast_value)
-            prediction_history.append(forecast_value)
-            current_data['sales_volume'] = forecast_value
-
-            if include_confidence:
-                mae = metrics.get('MAE', 0)
-                rmse = metrics.get('RMSE', 0)
-                error_estimate = (0.7 * mae) + (0.3 * rmse)
-                z_score = 1.96
-                if confidence_level == 0.99:
-                    z_score = 2.58
-                elif confidence_level == 0.9:
-                    z_score = 1.645
-                elif confidence_level == 0.85:
-                    z_score = 1.44
-                elif confidence_level == 0.8:
-                    z_score = 1.28
-                step_factor = 1 + 0.1 * (i + 1)
-                margin = z_score * error_estimate * step_factor
-                lower_bounds.append(max(0, forecast_value - margin))
-                upper_bounds.append(forecast_value + margin)
-            else:
-                lower_bounds.append(None)
-                upper_bounds.append(None)
-
-    return {
-        'dates': forecast_dates,
-        'dates_str': [d.strftime('%Y-%m-%d') for d in forecast_dates],
-        'values': forecast_values,
-        'lower_bounds': lower_bounds,
-        'upper_bounds': upper_bounds,
+    forecast.update({
         'method': forecast_method,
         'horizon': forecast_weeks,
         'confidence_level': confidence_level if include_confidence else None,
-    }
+    })
+    return forecast
+
 
 # Helper function to convert datetime columns to strings for Streamlit display
 def prepare_df_for_display(df):
@@ -2457,20 +2349,61 @@ def main():
                             ensemble_pred = (pred_lgbm + pred_rf) / 2
                         
                         metrics = evaluate_preds(y_test, ensemble_pred)
-                        
-                        # Store model results
+                        residual_std = float(np.std(y_test - ensemble_pred, ddof=1)) if len(y_test) > 1 else 0.0
+
+                        # ------------------------------------------------------------------
+                        # Refit preprocessing and models on the full data so that forecasts
+                        # leverage the entire history for each region-product combination.
+                        # This prevents flat forecasts that can arise when models only see
+                        # a truncated training window.
+                        # ------------------------------------------------------------------
+                        imputer_full = SimpleImputer(strategy='mean')
+                        X_full = group_eng[feature_cols]
+                        X_full_clean = pd.DataFrame(
+                            imputer_full.fit_transform(X_full),
+                            columns=feature_cols,
+                            index=group_eng.index,
+                        )
+
+                        if feature_selection_enabled:
+                            k = min(k_features, len(feature_cols))
+                            selector_full = SelectKBest(score_func=f_regression, k=k)
+                            X_full_sel = selector_full.fit_transform(X_full_clean, group_eng['sales_volume'])
+                            final_features = X_full_clean.columns[selector_full.get_support()].tolist()
+                        else:
+                            selector_full = None
+                            X_full_sel = X_full_clean.values
+                            final_features = feature_cols
+
+                        lgbm_full = lgb.LGBMRegressor(
+                            learning_rate=lgbm_learning_rate,
+                            n_estimators=lgbm_n_estimators,
+                            max_depth=lgbm_max_depth,
+                            random_state=42,
+                        )
+                        rf_full = RandomForestRegressor(
+                            n_estimators=rf_n_estimators,
+                            max_depth=rf_max_depth,
+                            min_samples_split=rf_min_samples_split,
+                            random_state=42,
+                        )
+                        lgbm_full.fit(X_full_sel, group_eng['sales_volume'])
+                        rf_full.fit(X_full_sel, group_eng['sales_volume'])
+
+                        # Store model results trained on the full history
                         result_data = {
                             'metrics': metrics,
+                            'residual_std': residual_std,
                             'y_test': y_test,
                             'y_pred': ensemble_pred,
                             'test_data': test,
-                            'selected_features': selected_features,
+                            'selected_features': final_features,
                             'models': {
-                                'lgbm': lgbm,
-                                'rf': rf
+                                'lgbm': lgbm_full,
+                                'rf': rf_full,
                             },
-                            'imputer': imputer,
-                            'selector': selector if feature_selection_enabled else None,
+                            'imputer': imputer_full,
+                            'selector': selector_full,
                             'feature_cols': feature_cols,
                             'feature_selection_enabled': feature_selection_enabled,
                             'ensemble_method': ensemble_method,
@@ -2480,10 +2413,10 @@ def main():
                                 'train_end_date': train_end_date,
                                 'test_start_date': test_start_date,
                                 'test_end_date': test_end_date,
-                                'split_method': split_method
-                            }
+                                'split_method': split_method,
+                            },
                         }
-                        
+
                         rp_results[(region, product)] = result_data
                     
                     # Set progress to 100% when complete
@@ -2918,12 +2851,9 @@ def main():
                             if not pd.api.types.is_datetime64_any_dtype(group['week_start']):
                                 group['week_start'] = pd.to_datetime(group['week_start'])
 
-                            # Use deterministic feature engineering for historical data
-                            group_eng = enhanced_feature_engineering(group, forecasting_mode=False)
-
                             forecast = generate_detailed_forecast(
                                 res,
-                                group_eng,
+                                group,
                                 product,
                                 forecast_weeks,
                                 forecast_method,
