@@ -954,7 +954,6 @@ def create_metrics_dashboard(metrics):
     with col5:
         st.metric("SMAPE", f"{metrics['SMAPE']:.2f}%")
 
-@st.cache_data(ttl=3600)  # Cache for 1 hour to improve performance
 def create_comprehensive_data_overview(df):
     """Create comprehensive data overview with multiple visualizations."""
     
@@ -1011,6 +1010,20 @@ def create_comprehensive_data_overview(df):
         else:
             return str(int(value))
 
+    def generate_log_ticks(max_val: float) -> list:
+        """Generate tick positions for log-scaled axes with custom spacing."""
+        max_val = max(max_val, 2e8)
+        tick_vals = [9e7, 1e8, 2e8]
+        val = 3e8
+        while val <= min(max_val, 9e8):
+            tick_vals.append(val)
+            val += 1e8
+        val = 1e9
+        while val <= max_val:
+            tick_vals.append(val)
+            val += 1e9
+        return tick_vals
+
     # Visualizations
     st.markdown("### 📊 Sales Volume Analysis")
     
@@ -1027,30 +1040,33 @@ def create_comprehensive_data_overview(df):
             'formatted_volume': [format_value_with_unit(val) for val in region_volume.values]
         })
         
+        # Create the base figure
         fig_region = px.bar(
             data_frame=region_df,
             x='Region',
             y='sales_volume',
+            orientation='v',  # Make vertical
             title='Total Weekly Sales Volume by Region',
-            labels={'sales_volume': 'Weekly Sales Volume (Litres)'},
-            color='sales_volume',
-            color_continuous_scale='viridis',
+            labels={'sales_volume': 'Weekly Sales Volume (Litres)', 'Region': 'Region'},
+            color='Region',  # Use Region for coloring
+            color_discrete_map={'South': '#87CEEB'},  # Set custom color for South
+            color_discrete_sequence=px.colors.sequential.Blues[5:],  # Use Blues for other regions
             custom_data='formatted_volume'
         )
         fig_region.update_traces(
             hovertemplate='Region: %{x}<br>Sales Volume: %{y:.2f} (%{customdata})<extra></extra>'
         )
         fig_region.update_layout(
-            height=500,
+            height=1000,
             width=800,
             template='plotly_white',
             font=dict(size=14),
             title_font_size=18,
-            xaxis_title_font_size=14,
-            yaxis_title='Weekly Sales Volume (Litres)',
-            yaxis_title_font_size=14
+            yaxis_title='Sales Volume (Litres)',
+            yaxis_title_font_size=14,
+            coloraxis_showscale=False
         )
-        fig_region.update_xaxes(tickangle=45)
+        fig_region.update_xaxes(categoryorder='total descending')  # Keep the order consistent
         return fig_region
     
     @st.cache_data(ttl=3600)  # Cache for 1 hour
@@ -1068,92 +1084,155 @@ def create_comprehensive_data_overview(df):
 
     @st.cache_data(ttl=3600)
     def create_product_chart(product_df, log_y=False):
+        # Sort products by sales volume (descending) to ensure consistent ordering
+        product_df = product_df.sort_values('sales_volume', ascending=False)
+        
+        # Define a custom color map with professional colors
+        custom_color_map = {
+            'HSD': '#1f77b4',    # Dark blue
+            'PMG': '#d62728',    # Dark red
+            'HOBC': '#2ca02c'    # Dark green
+        }
+        
         fig_product = px.bar(
             data_frame=product_df,
             x='Product',
             y='sales_volume',
+            orientation='v',  # Make vertical
             title='Total Sales Volume by Product',
-            labels={'sales_volume': 'Sales Volume (Litres)'},
-            color='sales_volume',
-            color_continuous_scale='plasma',
+            labels={'sales_volume': 'Sales Volume (Litres)', 'Product': 'Fuel Type'},
+            color='Product',
+            color_discrete_map=custom_color_map,
             custom_data='formatted_volume',
-            log_y=log_y
+            log_y=log_y  # Use log_y for vertical bars
         )
         fig_product.update_traces(
-            hovertemplate='Product: %{x}<br>Sales Volume: %{y:.2f} (%{customdata})<extra></extra>'
+            hovertemplate='Fuel Type: %{x}<br>Sales Volume: %{y:.2f} (%{customdata})<extra></extra>'
         )
         fig_product.update_layout(
-            height=500,
-            width=800,
+            height=800,
+            width=500,
             template='plotly_white',
-            font=dict(size=14),
+            font=dict(size=16),
             title_font_size=18,
-            xaxis_title_font_size=14,
             yaxis_title='Sales Volume (Litres)',
             yaxis_title_font_size=14,
             coloraxis_showscale=False
         )
         if log_y:
+            # Find the minimum value to ensure all products are visible
+            min_vals = product_df.groupby('Product')['sales_volume'].min()
+            # Get the minimum value specifically for HOBC
+            hobc_min = min_vals.get('HOBC', min_vals.min())
+            # Use a lower minimum to ensure HOBC is visible
+            overall_min = min(hobc_min * 0.5, 1e7)
+            
             max_val = product_df['sales_volume'].max()
-            tick_vals = [9e7] + [1e8 * i for i in range(1, int(max_val / 1e8) + 2)]
-            tick_text = [format_tick(v) for v in tick_vals]
-            fig_product.update_yaxes(tickvals=tick_vals, ticktext=tick_text)
-        fig_product.update_xaxes(tickangle=45)
+            tick_vals = generate_log_ticks(max_val)
+            tick_text = [format_tick(v) + '        ' for v in tick_vals]  # Add more space after each label
+            axis_max = tick_vals[-1]
+            
+            # Set a lower range to ensure all products are visible
+            log_min = np.log10(overall_min)
+            
+            fig_product.update_yaxes(
+                tickmode='array',
+                tickvals=tick_vals,
+                ticktext=tick_text,
+                range=[log_min, np.log10(axis_max)],
+                tickfont=dict(size=16),  # Increase font size further
+                ticksuffix='        '  # Add more space after labels
+            )
         return fig_product
 
     @st.cache_data(ttl=3600)
     def create_region_product_chart(df, log_y=False):
+        # Calculate total volume by region for sorting
+        region_totals = df.groupby('Region')['sales_volume'].sum().sort_values(ascending=False)
+        region_order = region_totals.index.tolist()
+        
+        # Group data and calculate volumes
         rp_data = df.groupby(['Region', 'Product'])['sales_volume'].sum().reset_index()
         rp_data['formatted_volume'] = rp_data['sales_volume'].apply(format_value_with_unit)
+        
+        # Sort by the predefined region order
+        rp_data['Region'] = pd.Categorical(rp_data['Region'], categories=region_order, ordered=True)
+        rp_data = rp_data.sort_values('Region')
+        
+        # Define a custom color map with darker colors for better visibility
+        custom_color_map = {
+            'HSD': '#1f77b4',    # Dark blue
+            'PMG': '#d62728',    # Dark red
+            'HOBC': '#2ca02c'    # Dark green
+        }
+        
         fig_rp = px.bar(
             rp_data,
             x='Region',
             y='sales_volume',
             color='Product',
             barmode='group',
+            orientation='v',  # Make vertical
             title='Sales Volume by Region and Product',
-            labels={'sales_volume': 'Sales Volume (Litres)'},
+            labels={'sales_volume': 'Sales Volume (Litres)', 'Region': 'Region', 'Product': 'Fuel Type'},
             custom_data='formatted_volume',
-            log_y=log_y
+            log_y=log_y,  # Use log_y for vertical bars
+            color_discrete_map=custom_color_map  # Use custom color map
         )
         fig_rp.update_traces(
-            hovertemplate='Region: %{x}<br>Product: %{fullData.name}<br>Sales Volume: %{y:.2f} (%{customdata})<extra></extra>'
+            hovertemplate='Region: %{x}<br>Fuel Type: %{fullData.name}<br>Sales Volume: %{y:.2f} (%{customdata})<extra></extra>'
         )
         fig_rp.update_layout(
-            height=600,
+            height=1000,
             width=800,
             template='plotly_white',
-            yaxis_title='Sales Volume (Litres)'
+            yaxis_title='Sales Volume (Litres)',
+            font=dict(size=12)
         )
         if log_y:
+            # Find the minimum value to ensure all products are visible
+            product_mins = rp_data.groupby('Product')['sales_volume'].min()
+            # Get the minimum value specifically for HOBC
+            hobc_min = product_mins.get('HOBC', product_mins.min())
+            # Use a lower minimum to ensure HOBC is visible
+            overall_min = min(hobc_min * 0.5, 1e7)
+            
             max_val = rp_data['sales_volume'].max()
-            tick_vals = [9e7] + [1e8 * i for i in range(1, int(max_val / 1e8) + 2)]
-            tick_text = [format_tick(v) for v in tick_vals]
-            fig_rp.update_yaxes(tickvals=tick_vals, ticktext=tick_text)
-        fig_rp.update_xaxes(tickangle=45)
+            tick_vals = generate_log_ticks(max_val)
+            tick_text = [format_tick(v) + '        ' for v in tick_vals]  # Add more space after each label
+            axis_max = tick_vals[-1]
+            
+            # Set a lower range to ensure all products are visible
+            log_min = np.log10(overall_min)
+            
+            fig_rp.update_yaxes(
+                tickmode='array',
+                tickvals=tick_vals,
+                ticktext=tick_text,
+                range=[log_min, np.log10(axis_max)],
+                tickfont=dict(size=16),  # Increase font size
+                ticksuffix='            '  # Add more space after labels
+            )
         return fig_rp
 
     tab_region, tab_product, tab_region_product = st.tabs(["By Region", "By Product", "Region vs Product"])
+    
     with tab_region:
         fig_region = create_region_volume_chart(df)
         st.plotly_chart(fig_region, use_container_width=True)
+    
     with tab_product:
+        # Create toggle widget inside the tab
+        show_lagged_product = st.toggle("Show logarithmic scale", key="product_lagged", help="Toggle to view data in logarithmic scale")
         product_df = create_product_volume_chart(df)
-        sub_normal, sub_lagged = st.tabs(["Normal", "Lagged"])
-        with sub_normal:
-            fig_product = create_product_chart(product_df)
-            st.plotly_chart(fig_product, use_container_width=True)
-        with sub_lagged:
-            fig_product_lag = create_product_chart(product_df, log_y=True)
-            st.plotly_chart(fig_product_lag, use_container_width=True)
+        fig_product = create_product_chart(product_df, log_y=show_lagged_product)
+        st.plotly_chart(fig_product, use_container_width=True)
+    
     with tab_region_product:
-        rp_normal, rp_lagged = st.tabs(["Normal", "Lagged"])
-        with rp_normal:
-            fig_rp = create_region_product_chart(df)
-            st.plotly_chart(fig_rp, use_container_width=True)
-        with rp_lagged:
-            fig_rp_log = create_region_product_chart(df, log_y=True)
-            st.plotly_chart(fig_rp_log, use_container_width=True)
+        # Create toggle widget inside the tab
+        show_lagged_rp = st.toggle("Show logarithmic scale", key="rp_lagged", help="Toggle to view data in logarithmic scale")
+        fig_rp = create_region_product_chart(df, log_y=show_lagged_rp)
+        st.plotly_chart(fig_rp, use_container_width=True)
 
     # Time series analysis
     st.markdown("### 📈 Monthly Sales Volume Trend")
@@ -1171,7 +1250,15 @@ def create_comprehensive_data_overview(df):
         )
         df_monthly['week_start'] = df_monthly['week_start'].astype(str)
         df_monthly['formatted_volume'] = df_monthly['sales_volume'].apply(format_value_with_unit)
+        
+        # Define a custom color map with darker, professional colors
+        custom_color_map = {
+            'HSD': '#1f77b4',    # Dark blue
+            'PMG': '#d62728',    # Dark red
+            'HOBC': '#2ca02c'    # Dark green
+        }
 
+        # Create trend line without markers for cleaner visualization
         fig_monthly = px.line(
             df_monthly,
             x='week_start',
@@ -1180,31 +1267,72 @@ def create_comprehensive_data_overview(df):
             title='Monthly Sales Volume Trend by Fuel Type',
             labels={'week_start': 'Month', 'sales_volume': 'Monthly Sales Volume (Litres)', 'Product': 'Fuel Type'},
             custom_data='formatted_volume',
-            log_y=log_y
+            log_y=log_y,
+            color_discrete_map=custom_color_map,  # Use custom color map
+            line_shape='spline',  # Use spline for smoother trend lines
+            markers=False  # Remove markers to show clean trend lines
         )
+        
+        # Update line thickness for better visibility
         fig_monthly.update_traces(
+            line=dict(width=4),  # Thicker lines for better trend visibility
             hovertemplate='Month: %{x}<br>Fuel Type: %{fullData.name}<br>Monthly Sales Volume: %{y:.2f} (%{customdata})<extra></extra>'
         )
+        
         fig_monthly.update_layout(
-            height=450,
+            height=700,
             width=800,
-            template='plotly_white'
+            template='plotly_white',
+            font=dict(size=14),
+            legend=dict(font=dict(size=16)),  # Larger legend font
+            margin=dict(l=100, r=100, t=70, b=70),  # Increase left and right margins for y-axis labels
+            yaxis=dict(title_standoff=60)  # Increase distance between axis title and tick labels
         )
+        
         if log_y:
+            # Find the minimum value for each product to ensure all are visible
+            min_vals = df_monthly.groupby('Product')['sales_volume'].min()
+            
+            # Get the minimum value specifically for HOBC and ensure it's properly handled
+            hobc_min = min_vals.get('HOBC', min_vals.min())
+            
+            # Use a much lower minimum to ensure HOBC is visible - go even lower than before
+            overall_min = min(hobc_min * 0.1, 1e6)  # Ensure we go extremely low for HOBC
+            
             max_val = df_monthly['sales_volume'].max()
-            tick_vals = [9e7] + [1e8 * i for i in range(1, int(max_val / 1e8) + 2)]
-            tick_text = [format_tick(v) for v in tick_vals]
-            fig_monthly.update_yaxes(tickvals=tick_vals, ticktext=tick_text)
+            
+            # Generate custom tick values that include the range for all products
+            # Start with very low values to ensure HOBC is visible
+            base_ticks = [1e6, 5e6, 1e7, 5e7] + generate_log_ticks(max_val)
+            tick_vals = sorted(list(set(base_ticks)))  # Remove duplicates and sort
+            
+            # Add more space after each label
+            tick_text = [format_tick(v) + '                          ' for v in tick_vals]  # Add much more space
+            axis_max = tick_vals[-1]
+            
+            # Set a much lower range to ensure HOBC is visible
+            log_min = np.log10(overall_min)  # Ensure we go low enough for HOBC
+            
+            fig_monthly.update_yaxes(
+                tickmode='array',
+                tickvals=tick_vals,
+                ticktext=tick_text,
+                range=[log_min, np.log10(axis_max)],
+                tickfont=dict(size=16),  # Increase font size further
+                ticksuffix='                          ',  # Add much more space after labels
+                showgrid=True,  # Show grid lines for better readability
+                gridwidth=1,
+                gridcolor='rgba(211, 211, 211, 0.5)',  # Light gray grid lines
+                title_standoff=30  # Increase distance between axis title and labels
+            )
+        
         fig_monthly.update_xaxes(tickangle=45)
         return fig_monthly
 
-    month_normal, month_lagged = st.tabs(["Normal", "Lagged"])
-    with month_normal:
-        fig_monthly = create_monthly_sales_chart(df)
-        st.plotly_chart(fig_monthly, use_container_width=True)
-    with month_lagged:
-        fig_monthly_log = create_monthly_sales_chart(df, log_y=True)
-        st.plotly_chart(fig_monthly_log, use_container_width=True)
+    # Create toggle widget directly in the flow
+    show_lagged_month = st.toggle("Show logarithmic scale", key="monthly_lagged", help="Toggle to view data in logarithmic scale")
+    fig_monthly = create_monthly_sales_chart(df, log_y=show_lagged_month)
+    st.plotly_chart(fig_monthly, use_container_width=True)
 
     st.markdown("### 💰 Monthly Average Price Trend by Fuel Type")
     
